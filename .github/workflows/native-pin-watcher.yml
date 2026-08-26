@@ -41,7 +41,7 @@ jobs:
             pattern=$(jq -r '.pattern' <<<"$pin")
             extract=$(jq -r '.extract' <<<"$pin")
             upstream=$(jq -r '.upstream' <<<"$pin")
-            pinned=$(grep -oE "$pattern" "$DOCKERFILE" | head -1 | sed -E "$extract")
+            pinned=$(grep -oE -e "$pattern" "$DOCKERFILE" | head -1 | sed -E "$extract")
             if [ "$ptype" = "tag" ]; then
               latest=$(git ls-remote --tags "https://github.com/${upstream}.git" | grep -v '\^{}' | awk -F/ '{print $NF}' | sort -V | tail -1)
             else

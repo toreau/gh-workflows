@@ -1,0 +1,62 @@
+name: manifest-validate
+on:
+  workflow_call:
+    inputs:
+      paths:
+        required: true
+        type: string
+        description: Whitespace-separated paths to kubeconform + yamllint
+      yamllint-paths:
+        required: false
+        type: string
+        default: ""
+        description: Whitespace-separated additional paths, yamllint only
+      schemas-dir:
+        required: false
+        type: string
+        default: ""
+        description: Directory with custom CRD schemas for kubeconform (e.g. ci/schemas)
+      strict:
+        required: false
+        type: boolean
+        default: true
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - name: Install kubeconform
+        run: |
+          curl -sSLo /tmp/kubeconform.tar.gz https://github.com/yannh/kubeconform/releases/download/v0.8.0/kubeconform-linux-amd64.tar.gz
+          tar xzf /tmp/kubeconform.tar.gz -C /tmp
+      - name: kubeconform paths
+        env:
+          PATHS: ${{ inputs.paths }}
+          SCHEMAS_DIR: ${{ inputs.schemas-dir }}
+          STRICT: ${{ inputs.strict }}
+        run: |
+          schemas_arg=()
+          if [ -n "$SCHEMAS_DIR" ]; then
+            schemas_arg=(-schema-location "$SCHEMAS_DIR/{{.ResourceKind}}.json")
+          fi
+          strict_arg=()
+          if [ "$STRICT" = "true" ]; then strict_arg=(-strict); fi
+          for p in $PATHS; do
+            echo "::group::kubeconform $p"
+            /tmp/kubeconform "${strict_arg[@]}" -ignore-missing-schemas \
+              -schema-location default "${schemas_arg[@]}" "$p"
+            echo "::endgroup::"
+          done
+      - name: yamllint paths
+        env:
+          PATHS: ${{ inputs.paths }}
+          YAMLLINT_PATHS: ${{ inputs.yamllint-paths }}
+        run: |
+          pip install --quiet yamllint
+          for p in $PATHS $YAMLLINT_PATHS; do
+            echo "::group::yamllint $p"
+            yamllint -d relaxed "$p"
+            echo "::endgroup::"
+          done

@@ -30,6 +30,11 @@ on:
         required: false
         type: boolean
         default: true
+      signer-workflow:
+        required: false
+        type: string
+        default: "toreau/gh-workflows/.github/workflows/container-merge-attest.yml@refs/tags/v1"
+        description: Signer workflow identity for gh attestation verify (must match how callers pin this workflow)
     secrets:
       token:
         required: true
@@ -100,15 +105,21 @@ jobs:
           DIGEST: ${{ steps.digest.outputs.digest }}
           IMAGE: ${{ inputs.image }}
           REPO: ${{ inputs.attestation-repo }}
+          SIGNER: ${{ inputs.signer-workflow }}
         run: |
-          # Public repo -> no token needed. The attestations API can lag the
-          # push-to-registry upload a moment, so retry a few times.
+          # Attestations created inside a reusable workflow carry the reusable
+          # workflow as the build signer; pass --signer-workflow so the default
+          # identity check matches (see cli/cli#9045).
+          signer_args=()
+          if [ -n "$SIGNER" ]; then signer_args=(--signer-workflow "$SIGNER"); fi
+          # The attestations API can lag the push-to-registry upload a moment,
+          # so retry a few times.
           for i in 1 2 3 4 5; do
             gh attestation verify "oci://${IMAGE}@${DIGEST}" -R "${REPO}" \
-              --predicate-type https://slsa.dev/provenance/v1 \
+              --predicate-type https://slsa.dev/provenance/v1 "${signer_args[@]}" \
               && { echo "SLSA provenance verified"; break; }
             [ "$i" -lt 5 ] && sleep 5
           done
           gh attestation verify "oci://${IMAGE}@${DIGEST}" -R "${REPO}" \
-            --predicate-type https://spdx.dev/Document/v2.3
+            --predicate-type https://spdx.dev/Document/v2.3 "${signer_args[@]}"
           echo "attestations verified for ${DIGEST}"

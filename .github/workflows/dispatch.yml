@@ -30,7 +30,9 @@ jobs:
           EVENT: ${{ inputs.event-type }}
           PAYLOAD: ${{ inputs.payload }}
         run: |
-          gh api "repos/${TARGET}/dispatches" \
-            -f event_type="${EVENT}" \
-            -f client_payload="${PAYLOAD}"
+          # -f client_payload=... sends a string, but the API expects an object;
+          # build the JSON body and pipe it via --input -.
+          jq -cn --arg event "$EVENT" --argjson payload "$PAYLOAD" \
+            '{event_type:$event, client_payload:$payload}' \
+            | gh api "repos/${TARGET}/dispatches" --input -
           echo "dispatched ${EVENT} to ${TARGET}"

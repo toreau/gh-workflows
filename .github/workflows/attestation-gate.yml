@@ -1,0 +1,42 @@
+name: attestation-gate
+on:
+  workflow_call:
+    inputs:
+      owner-repo:
+        required: true
+        type: string
+        description: Owner/repo whose attestations to query, e.g. toreau/astronomy.aursand.no
+      digest:
+        required: true
+        type: string
+        description: Full image digest, e.g. sha256:<hex>
+      predicate-type:
+        required: false
+        type: string
+        default: "https://slsa.dev/provenance/v1"
+    secrets:
+      token:
+        required: true
+permissions:
+  contents: read
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify attestation exists (gate)
+        env:
+          GH_TOKEN: ${{ secrets.token }}
+          REPO: ${{ inputs.owner-repo }}
+          DIGEST: ${{ inputs.digest }}
+          PRED: ${{ inputs.predicate-type }}
+        run: |
+          api="repos/${REPO}/attestations/${DIGEST}"
+          resp=$(gh api "$api" 2>/dev/null) || { echo "no attestations for ${DIGEST} (404)"; exit 1; }
+          n=$(printf '%s' "$resp" | jq '.attestations | length')
+          [ "$n" -ge 1 ] || { echo "no attestations for ${DIGEST}"; exit 1; }
+          preds=$(printf '%s' "$resp" | jq -r '[.attestations[].bundle.dsseEnvelope.payload | @base64d | fromjson | .predicateType] | join(" ")')
+          echo "verified ${n} attestation(s) for ${DIGEST}: ${preds}"
+          case " ${preds} " in
+            *" ${PRED} "*) echo "predicate OK (${PRED})" ;;
+            *) echo "predicate ${PRED} missing (${preds})"; exit 1 ;;
+          esac

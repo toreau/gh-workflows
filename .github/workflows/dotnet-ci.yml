@@ -1,0 +1,54 @@
+name: dotnet-ci
+on:
+  workflow_call:
+    inputs:
+      solution:
+        required: true
+        type: string
+        description: Solution file to restore/build/test, e.g. Astronomy.slnx
+      global-json-file:
+        required: false
+        type: string
+        default: "global.json"
+      coverage:
+        required: false
+        type: boolean
+        default: true
+        description: Collect, summarize and upload XPlat code coverage
+      upload-artifacts:
+        required: false
+        type: boolean
+        default: true
+permissions:
+  contents: read
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68  # v6.0.0
+        with:
+          global-json-file: ${{ inputs.global-json-file }}
+      - run: dotnet restore ${{ inputs.solution }}
+      - run: dotnet build ${{ inputs.solution }} -c Release --no-restore
+      - name: Test with coverage
+        if: inputs.coverage
+        run: dotnet test ${{ inputs.solution }} -c Release --no-build --collect:"XPlat Code Coverage" --results-directory coverage-results
+      - name: Test
+        if: ${{ ! inputs.coverage }}
+        run: dotnet test ${{ inputs.solution }} -c Release --no-build
+      - name: Summarize coverage
+        if: inputs.coverage
+        run: |
+          echo "Coverage per project (line rate):"
+          for f in coverage-results/*/coverage.cobertura.xml; do
+            [ -f "$f" ] || continue
+            echo "  $(basename "$(dirname "$f")"): $(grep -o 'line-rate="[^"]*"' "$f" | head -1 | cut -d'"' -f2)"
+          done
+          true
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        if: ${{ inputs.coverage && inputs.upload-artifacts }}
+        with:
+          name: coverage-reports
+          path: coverage-results/**/coverage.cobertura.xml
+          if-no-files-found: error

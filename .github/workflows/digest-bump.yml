@@ -9,7 +9,7 @@ on:
       image-prefix:
         required: true
         type: string
-        description: Image line prefix to replace, e.g. "image: ghcr.io/toreau/astronomy-api@sha256:"
+        description: 'Image line prefix to replace, e.g. "image: ghcr.io/toreau/astronomy-api@sha256:"'
       digest:
         required: true
         type: string

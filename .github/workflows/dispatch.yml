@@ -1,0 +1,36 @@
+name: dispatch
+on:
+  workflow_call:
+    inputs:
+      target-repo:
+        required: true
+        type: string
+        description: Repo to dispatch to, e.g. toreau/k8s-research
+      event-type:
+        required: true
+        type: string
+      payload:
+        required: false
+        type: string
+        default: "{}"
+        description: JSON object for client_payload
+    secrets:
+      token:
+        required: true
+permissions:
+  contents: read
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send repository_dispatch
+        env:
+          GH_TOKEN: ${{ secrets.token }}
+          TARGET: ${{ inputs.target-repo }}
+          EVENT: ${{ inputs.event-type }}
+          PAYLOAD: ${{ inputs.payload }}
+        run: |
+          gh api "repos/${TARGET}/dispatches" \
+            -f event_type="${EVENT}" \
+            -f client_payload="${PAYLOAD}"
+          echo "dispatched ${EVENT} to ${TARGET}"

@@ -1,0 +1,82 @@
+name: native-pin-watcher
+on:
+  workflow_call:
+    inputs:
+      dockerfile:
+        required: false
+        type: string
+        default: "src/Astronomy.Api/Dockerfile"
+      pins:
+        required: true
+        type: string
+        description: JSON array of {name, type (tag|commit), pattern, extract, upstream}
+      issue-title:
+        required: false
+        type: string
+        default: "Native dependency update available"
+      labels:
+        required: false
+        type: string
+        default: ""
+permissions:
+  contents: read
+  issues: write
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - name: Check native upstreams for newer versions
+        id: check
+        env:
+          DOCKERFILE: ${{ inputs.dockerfile }}
+          PINS_JSON: ${{ inputs.pins }}
+        run: |
+          changed_lines=()
+          echo "pinned checks:"
+          while read -r pin; do
+            [ -z "$pin" ] && continue
+            name=$(jq -r '.name' <<<"$pin")
+            ptype=$(jq -r '.type' <<<"$pin")
+            pattern=$(jq -r '.pattern' <<<"$pin")
+            extract=$(jq -r '.extract' <<<"$pin")
+            upstream=$(jq -r '.upstream' <<<"$pin")
+            pinned=$(grep -oE "$pattern" "$DOCKERFILE" | head -1 | sed -E "$extract")
+            if [ "$ptype" = "tag" ]; then
+              latest=$(git ls-remote --tags "https://github.com/${upstream}.git" | grep -v '\^{}' | awk -F/ '{print $NF}' | sort -V | tail -1)
+            else
+              latest=$(git ls-remote "https://github.com/${upstream}.git" HEAD | awk '{print $1}')
+            fi
+            echo "  $name: pinned=$pinned latest=$latest"
+            if [ -n "$pinned" ] && [ "$pinned" != "$latest" ]; then
+              changed_lines+=("- $name: pinned \`$pinned\` -> latest \`$latest\`")
+            fi
+          done < <(jq -c '.[]' <<<"$PINS_JSON")
+          if [ "${#changed_lines[@]}" -gt 0 ]; then
+            printf '%s\n' "${changed_lines[@]}" > /tmp/changes.txt
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No newer native upstreams."
+          fi
+      - name: Open issue when an upstream moved
+        if: steps.check.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TITLE: ${{ inputs.issue-title }}
+          LABELS: ${{ inputs.labels }}
+        run: |
+          {
+            echo "Native dependency update available:"
+            echo
+            cat /tmp/changes.txt
+            echo
+            echo "Review and bump the Dockerfile pins deliberately."
+          } > /tmp/body.txt
+          EXISTING=$(gh issue list --state open --search "in:title ${TITLE}" --json number --jq 'length')
+          if [ "$EXISTING" -eq 0 ]; then
+            args=(--title "${TITLE}" --body-file /tmp/body.txt)
+            [ -n "$LABELS" ] && args+=(--label "$LABELS")
+            gh issue create "${args[@]}"
+          else
+            echo "issue already exists"
+          fi

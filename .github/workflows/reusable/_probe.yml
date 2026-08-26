@@ -1,0 +1,8 @@
+name: probe
+on:
+  workflow_call:
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "probe ok, offentlig reusable workflow nådd fra offentlig kaller"

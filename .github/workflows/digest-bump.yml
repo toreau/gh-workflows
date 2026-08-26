@@ -1,0 +1,81 @@
+name: digest-bump
+on:
+  workflow_call:
+    inputs:
+      file-path:
+        required: true
+        type: string
+        description: Path to the file containing the image line to bump
+      image-prefix:
+        required: true
+        type: string
+        description: Image line prefix to replace, e.g. "image: ghcr.io/toreau/astronomy-api@sha256:"
+      digest:
+        required: true
+        type: string
+        description: Full digest, e.g. sha256:<hex>
+      sha:
+        required: false
+        type: string
+        default: ""
+        description: Commit SHA for the default commit message
+      commit-message:
+        required: false
+        type: string
+        default: "chore: bump image digest to {digest12} (sha {sha7})"
+        description: Commit message; tokens {digest12} {sha7} {digest} {sha} are substituted
+      bot-name:
+        required: false
+        type: string
+        default: "k8s-research bot"
+      bot-email:
+        required: false
+        type: string
+        default: "actions@users.noreply.github.com"
+    secrets:
+      token:
+        required: true
+permissions:
+  contents: write
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          token: ${{ secrets.token }}
+      - name: Bump image digest
+        id: update
+        env:
+          FILE: ${{ inputs.file-path }}
+          PREFIX: ${{ inputs.image-prefix }}
+          DIGEST: ${{ inputs.digest }}
+        run: |
+          d="${DIGEST#sha256:}"
+          sed -i -E "s#(${PREFIX})[0-9a-f]{64}#\1${d}#" "$FILE"
+          if git diff --quiet "$FILE"; then
+            echo "digest unchanged, nothing to commit"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "new image line: $(grep 'image:' "$FILE" | head -1)"
+          fi
+      - name: Commit + push
+        if: steps.update.outputs.changed == 'true'
+        env:
+          FILE: ${{ inputs.file-path }}
+          DIGEST: ${{ inputs.digest }}
+          SHA: ${{ inputs.sha }}
+          MSG: ${{ inputs.commit-message }}
+          BOT_NAME: ${{ inputs.bot-name }}
+          BOT_EMAIL: ${{ inputs.bot-email }}
+        run: |
+          d="${DIGEST#sha256:}"
+          msg="${MSG//\{digest12\}/${d:0:12}}"
+          msg="${msg//\{digest\}/$d}"
+          msg="${msg//\{sha7\}/${SHA:0:7}}"
+          msg="${msg//\{sha\}/$SHA}"
+          git config user.name "$BOT_NAME"
+          git config user.email "$BOT_EMAIL"
+          git add "$FILE"
+          git commit -m "$msg"
+          git push

@@ -6,6 +6,11 @@ on:
         required: true
         type: string
         description: Path to the file containing the image line to bump
+      file-paths:
+        required: false
+        type: string
+        default: ""
+        description: 'Whitespace-separated file paths to bump (overrides file-path); all files get the same digest in one commit'
       image-prefix:
         required: true
         type: string
@@ -79,22 +84,33 @@ jobs:
         id: update
         env:
           FILE: ${{ inputs.file-path }}
+          FILE_PATHS: ${{ inputs.file-paths }}
           PREFIX: ${{ inputs.image-prefix }}
           DIGEST: ${{ inputs.digest }}
         run: |
           d="${DIGEST#sha256:}"
-          sed -i -E "s#(${PREFIX})[0-9a-f]{64}#\1${d}#" "$FILE"
-          if git diff --quiet "$FILE"; then
-            echo "digest unchanged, nothing to commit"
-          else
+          files="${FILE_PATHS:-$FILE}"
+          changed=""
+          for f in $files; do
+            sed -i -E "s#(${PREFIX})[0-9a-f]{64}#\1${d}#" "$f"
+            if git diff --quiet "$f"; then
+              echo "$f: unchanged"
+            else
+              echo "$f: changed -> $(grep 'image:' "$f" | head -1)"
+              changed="$changed $f"
+            fi
+          done
+          if [ -n "$changed" ]; then
             echo "changed=true" >> "$GITHUB_OUTPUT"
-            echo "new image line: $(grep 'image:' "$FILE" | head -1)"
+          else
+            echo "digest unchanged, nothing to commit"
           fi
       - name: Commit + push
         if: steps.update.outputs.changed == 'true'
         id: push
         env:
           FILE: ${{ inputs.file-path }}
+          FILE_PATHS: ${{ inputs.file-paths }}
           DIGEST: ${{ inputs.digest }}
           SHA: ${{ inputs.sha }}
           MSG: ${{ inputs.commit-message }}
@@ -112,6 +128,7 @@ jobs:
             printf '%s' "$s"
           }
           d="${DIGEST#sha256:}"
+          files="${FILE_PATHS:-$FILE}"
           msg="$(subst "$MSG")"
           git config user.name "$BOT_NAME"
           git config user.email "$BOT_EMAIL"
@@ -121,7 +138,8 @@ jobs:
             [ -n "$head" ] || { echo "::error::open-pr requires a non-empty head-branch (or sha for default 'bump/{sha7}')"; exit 1; }
             git checkout -B "$head"
           fi
-          git add "$FILE"
+          # shellcheck disable=SC2086  # intentional word-splitting (whitespace-separated list)
+          git add $files
           git commit -m "$msg"
           if [ "$OPEN_PR" = "true" ]; then
             git push --force -u origin "$head"

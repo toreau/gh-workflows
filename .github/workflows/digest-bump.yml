@@ -32,11 +32,42 @@ on:
         required: false
         type: string
         default: "actions@users.noreply.github.com"
+      open-pr:
+        required: false
+        type: boolean
+        default: false
+        description: Push to a feature branch and open a pull request instead of pushing to the base branch
+      base-branch:
+        required: false
+        type: string
+        default: ""
+        description: 'PR base branch (default: the repository default branch)'
+      head-branch:
+        required: false
+        type: string
+        default: "bump/{sha7}"
+        description: PR head branch; tokens {digest12} {sha7} {digest} {sha} are substituted
+      pr-title:
+        required: false
+        type: string
+        default: ""
+        description: 'PR title; tokens substituted (default: the commit message)'
+      pr-body:
+        required: false
+        type: string
+        default: ""
+        description: 'PR body; tokens substituted (default: auto-generated body)'
+      auto-merge:
+        required: false
+        type: boolean
+        default: false
+        description: Enable GitHub auto-merge (squash) on the PR; requires repo setting 'Allow auto-merge' and no required reviews
     secrets:
       token:
         required: true
 permissions:
   contents: write
+  pull-requests: write
 jobs:
   bump:
     runs-on: ubuntu-latest
@@ -61,6 +92,7 @@ jobs:
           fi
       - name: Commit + push
         if: steps.update.outputs.changed == 'true'
+        id: push
         env:
           FILE: ${{ inputs.file-path }}
           DIGEST: ${{ inputs.digest }}
@@ -68,14 +100,72 @@ jobs:
           MSG: ${{ inputs.commit-message }}
           BOT_NAME: ${{ inputs.bot-name }}
           BOT_EMAIL: ${{ inputs.bot-email }}
+          OPEN_PR: ${{ inputs.open-pr }}
+          HEAD_BRANCH: ${{ inputs.head-branch }}
         run: |
+          subst() {
+            local s="$1"
+            s="${s//\{digest12\}/${d:0:12}}"
+            s="${s//\{digest\}/$d}"
+            s="${s//\{sha7\}/${SHA:0:7}}"
+            s="${s//\{sha\}/$SHA}"
+            printf '%s' "$s"
+          }
           d="${DIGEST#sha256:}"
-          msg="${MSG//\{digest12\}/${d:0:12}}"
-          msg="${msg//\{digest\}/$d}"
-          msg="${msg//\{sha7\}/${SHA:0:7}}"
-          msg="${msg//\{sha\}/$SHA}"
+          msg="$(subst "$MSG")"
           git config user.name "$BOT_NAME"
           git config user.email "$BOT_EMAIL"
+          head=""
+          if [ "$OPEN_PR" = "true" ]; then
+            head="$(subst "$HEAD_BRANCH")"
+            [ -n "$head" ] || { echo "::error::open-pr requires a non-empty head-branch (or sha for default 'bump/{sha7}')"; exit 1; }
+            git checkout -B "$head"
+          fi
           git add "$FILE"
           git commit -m "$msg"
-          git push
+          if [ "$OPEN_PR" = "true" ]; then
+            git push --force -u origin "$head"
+            echo "head=$head" >> "$GITHUB_OUTPUT"
+          else
+            git push
+          fi
+          echo "msg=$msg" >> "$GITHUB_OUTPUT"
+      - name: Create or update pull request
+        if: steps.update.outputs.changed == 'true' && inputs.open-pr && steps.push.outputs.head != ''
+        env:
+          GH_TOKEN: ${{ secrets.token }}
+          HEAD: ${{ steps.push.outputs.head }}
+          MSG: ${{ steps.push.outputs.msg }}
+          DIGEST: ${{ inputs.digest }}
+          SHA: ${{ inputs.sha }}
+          PR_TITLE: ${{ inputs.pr-title }}
+          PR_BODY: ${{ inputs.pr-body }}
+          BASE_BRANCH: ${{ inputs.base-branch }}
+          AUTO_MERGE: ${{ inputs.auto-merge }}
+        run: |
+          subst() {
+            local s="$1"
+            s="${s//\{digest12\}/${d:0:12}}"
+            s="${s//\{digest\}/$d}"
+            s="${s//\{sha7\}/${SHA:0:7}}"
+            s="${s//\{sha\}/$SHA}"
+            printf '%s' "$s"
+          }
+          d="${DIGEST#sha256:}"
+          title="$(subst "${PR_TITLE:-$MSG}")"
+          if [ -n "$PR_BODY" ]; then
+            body="$(subst "$PR_BODY")"
+          else
+            body="Automated digest bump from \`repository_dispatch\` \`astro-image-pushed\`:${SHA:+ SHA ${SHA:0:7},} digest \`${d:0:12}\`. Merge to roll the image."
+          fi
+          base="$BASE_BRANCH"
+          [ -n "$base" ] || base="$(gh repo view --json defaultBranchRef -q .defaultBranchRef.name)"
+          if gh pr view "$HEAD" --json number --jq .number >/dev/null 2>&1; then
+            echo "PR already exists, updating"
+            gh pr edit "$HEAD" --title "$title" --body "$body"
+          else
+            args=(--base "$base" --head "$HEAD" --title "$title" --body "$body")
+            [ "$AUTO_MERGE" = "true" ] && args+=(--auto --squash)
+            gh pr create "${args[@]}"
+          fi
+          echo "PR: $(gh pr view "$HEAD" --json url --jq .url)"

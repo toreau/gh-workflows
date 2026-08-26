@@ -68,7 +68,7 @@ jobs:
         env:
           MERGE_TAGS: ${{ inputs.merge-tags }}
         run: |
-          first=$(echo "$MERGE_TAGS" | awk '{$1=$1; print}' | cut -d' ' -f1)
+          first=$(echo "$MERGE_TAGS" | xargs | cut -d' ' -f1)
           d=$(docker buildx imagetools inspect "$first" --format '{{.Manifest.Digest}}')
           echo "digest=$d" >> "$GITHUB_OUTPUT"
           echo "resolved $d"

@@ -6,6 +6,12 @@
 # review-based promotion path used by k8s-research's `app-digest-bump.yml`.
 # Tokens {digest12} {sha7} {digest} {sha} are substituted in branch/title/body.
 #
+# Input safety: `digest` and `image-prefix` are treated strictly as DATA.
+# The digest must match ^sha256:[0-9a-f]{64}$, the prefix is matched literally
+# (never as a regex/executable), and every file must contain exactly one
+# matching image line or the step fails closed. No shell/sed/awk replacement
+# programs are constructed from caller input.
+#
 # Used by: k8s-research `app-digest-bump.yml` (open-pr mode, after the
 # attestation gate has verified the proposed digest).
 name: digest-bump
@@ -24,11 +30,11 @@ on:
       image-prefix:
         required: true
         type: string
-        description: 'Image line prefix to replace, e.g. "image: ghcr.io/toreau/astronomy-api@sha256:"'
+        description: 'Image line prefix to replace, e.g. "image: ghcr.io/toreau/astronomy-api@sha256:" (matched literally)'
       digest:
         required: true
         type: string
-        description: Full digest, e.g. sha256:<hex>
+        description: Full digest, e.g. sha256:<hex>; must match ^sha256:[0-9a-f]{64}$
       sha:
         required: false
         type: string
@@ -78,7 +84,7 @@ on:
         required: false
         type: boolean
         default: false
-        description: Enable GitHub auto-merge (squash) on the PR; requires repo setting 'Allow auto-merge' and no required reviews
+        description: Enable GitHub auto-merge (squash) on the PR; GitHub merges once required checks/branch-protection conditions are satisfied. Requires the repository setting 'Allow auto-merge'.
     secrets:
       token:
         required: true
@@ -101,23 +107,49 @@ jobs:
           PREFIX: ${{ inputs.image-prefix }}
           DIGEST: ${{ inputs.digest }}
         run: |
-          d="${DIGEST#sha256:}"
-          files="${FILE_PATHS:-$FILE}"
-          changed=""
-          for f in $files; do
-            sed -i -E "s#(${PREFIX})[0-9a-f]{64}#\1${d}#" "$f"
-            if git diff --quiet "$f"; then
-              echo "$f: unchanged"
-            else
-              echo "$f: changed -> $(grep 'image:' "$f" | head -1)"
-              changed="$changed $f"
-            fi
-          done
-          if [ -n "$changed" ]; then
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "digest unchanged, nothing to commit"
-          fi
+          python3 - <<'PY'
+          import os, re, sys
+
+          digest = os.environ["DIGEST"]
+          if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+              print("::error::invalid digest; expected sha256:<64 lowercase hex>", file=sys.stderr)
+              sys.exit(1)
+          prefix = os.environ["PREFIX"]
+          new_digest = digest[len("sha256:"):]
+          files = (os.environ.get("FILE_PATHS") or os.environ["FILE"]).split()
+          if not files:
+              print("::error::file-path or file-paths required", file=sys.stderr)
+              sys.exit(1)
+          # PREFIX is treated literally (never as regex/executable); only the
+          # 64 hex chars directly after it may vary.
+          image_line = re.compile(re.escape(prefix) + r"[0-9a-f]{64}")
+          changed = []
+          for f in files:
+              if not os.path.isfile(f):
+                  print(f"::error::{f} is not a file in this workspace", file=sys.stderr)
+                  sys.exit(1)
+              with open(f, "r", encoding="utf-8") as fh:
+                  data = fh.read()
+              matches = list(image_line.finditer(data))
+              if len(matches) != 1:
+                  print(f"::error::{f}: expected exactly 1 image line with the prefix, found {len(matches)}", file=sys.stderr)
+                  sys.exit(1)
+              m = matches[0]
+              new_data = data[:m.start()] + prefix + new_digest + data[m.end():]
+              if new_data != data:
+                  with open(f, "w", encoding="utf-8") as fh:
+                      fh.write(new_data)
+                  changed.append(f)
+                  print(f"{f}: changed")
+              else:
+                  print(f"{f}: unchanged")
+          if changed:
+              print("changed=true")
+              with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
+                  fh.write("changed=true\n")
+          else:
+              print("digest unchanged, nothing to commit")
+          PY
       - name: Commit + push
         if: steps.update.outputs.changed == 'true'
         id: push
@@ -141,7 +173,12 @@ jobs:
             printf '%s' "$s"
           }
           d="${DIGEST#sha256:}"
-          files="${FILE_PATHS:-$FILE}"
+          read -r -a files <<< "${FILE_PATHS:-$FILE}"
+          [ "${#files[@]}" -gt 0 ] || { echo "::error::no files to commit"; exit 1; }
+          for f in "${files[@]}"; do
+            git ls-files --error-unmatch -- "$f" >/dev/null 2>&1 \
+              || { echo "::error::$f is not a tracked file in this workspace"; exit 1; }
+          done
           msg="$(subst "$MSG")"
           git config user.name "$BOT_NAME"
           git config user.email "$BOT_EMAIL"
@@ -151,8 +188,7 @@ jobs:
             [ -n "$head" ] || { echo "::error::open-pr requires a non-empty head-branch (or sha for default 'bump/{sha7}')"; exit 1; }
             git checkout -B "$head"
           fi
-          # shellcheck disable=SC2086  # intentional word-splitting (whitespace-separated list)
-          git add $files
+          git add -- "${files[@]}"
           git commit -m "$msg"
           if [ "$OPEN_PR" = "true" ]; then
             git push --force -u origin "$head"
@@ -187,7 +223,7 @@ jobs:
           if [ -n "$PR_BODY" ]; then
             body="$(subst "$PR_BODY")"
           else
-            body="Automated digest bump from \`repository_dispatch\` \`astro-image-pushed\`:${SHA:+ SHA ${SHA:0:7},} digest \`${d:0:12}\`. Merge to roll the image."
+            body="Automated digest bump: digest \`${d:0:12}\`${SHA:+ (sha ${SHA:0:7})}. Merge to roll the image."
           fi
           base="$BASE_BRANCH"
           [ -n "$base" ] || base="$(gh repo view --json defaultBranchRef -q .defaultBranchRef.name)"
@@ -195,8 +231,18 @@ jobs:
             echo "PR already exists, updating"
             gh pr edit "$HEAD" --title "$title" --body "$body"
           else
-            args=(--base "$base" --head "$HEAD" --title "$title" --body "$body")
-            [ "$AUTO_MERGE" = "true" ] && args+=(--auto --squash)
-            gh pr create "${args[@]}"
+            gh pr create --base "$base" --head "$HEAD" --title "$title" --body "$body"
+          fi
+          # Auto-merge is a gh pr merge operation (--auto/--squash are NOT gh pr
+          # create flags). Enable it after create/edit so both new and existing
+          # PRs behave identically; GitHub merges once required conditions pass.
+          if [ "$AUTO_MERGE" = "true" ]; then
+            state=$(gh pr view "$HEAD" --json state --jq .state)
+            if [ "$state" = "OPEN" ]; then
+              gh pr merge "$HEAD" --auto --squash
+              echo "auto-merge enabled on $HEAD"
+            else
+              echo "PR state '$state'; auto-merge not enabled"
+            fi
           fi
           echo "PR: $(gh pr view "$HEAD" --json url --jq .url)"

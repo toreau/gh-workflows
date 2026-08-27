@@ -24,7 +24,7 @@ on:
         required: false
         type: string
         default: ""
-        description: Regex of file paths to exclude from kubeconform (passed to -ignore-filename-patterns), e.g. 'apps/.*/meta\.yaml$'
+        description: Regex of file paths to exclude from kubeconform (passed to -ignore-filename-pattern), e.g. 'apps/.*/meta\.yaml$'
 permissions:
   contents: read
 jobs:
@@ -50,7 +50,7 @@ jobs:
           strict_arg=()
           if [ "$STRICT" = "true" ]; then strict_arg=(-strict); fi
           exclude_arg=()
-          if [ -n "$EXCLUDE" ]; then exclude_arg=(-ignore-filename-patterns "$EXCLUDE"); fi
+          if [ -n "$EXCLUDE" ]; then exclude_arg=(-ignore-filename-pattern "$EXCLUDE"); fi
           for p in $PATHS; do
             echo "::group::kubeconform $p"
             /tmp/kubeconform "${strict_arg[@]}" -ignore-missing-schemas \

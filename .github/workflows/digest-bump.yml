@@ -211,7 +211,11 @@ jobs:
             printf '%s' "$s"
           }
           d="${DIGEST#sha256:}"
-          read -r -a files <<< "${FILE_PATHS:-$FILE}"
+          # Same whitespace-separated contract as the Python phase (spaces AND newlines).
+          set -f
+          # shellcheck disable=SC2206  # intentional word-splitting; noglob keeps glob chars literal
+          files=(${FILE_PATHS:-$FILE})
+          set +f
           [ "${#files[@]}" -gt 0 ] || { echo "::error::no files to commit"; exit 1; }
           for f in "${files[@]}"; do
             git ls-files --error-unmatch -- "$f" >/dev/null 2>&1 \

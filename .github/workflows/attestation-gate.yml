@@ -24,11 +24,11 @@ on:
       signer-repo:
         required: false
         type: string
-        description: "Expected signer repository (owner/repo), e.g. toreau/frosta-historielag.no"
+        description: "Expected signer repository (owner/repo), e.g. toreau/frosta-historielag.no. Mutually exclusive with signer-workflow."
       signer-workflow:
         required: false
         type: string
-        description: "Expected signer workflow path (no @ref), e.g. .github/workflows/ci.yml"
+        description: "Expected signer workflow with FULL owner/repo path (no @ref), e.g. toreau/frosta-historielag.no/.github/workflows/ci.yml. Mutually exclusive with signer-repo."
       source-ref:
         required: false
         type: string
@@ -69,8 +69,11 @@ jobs:
           fi
           args=(verify "oci://${IMAGE}@${DIGEST}" --repo "$OWNER_REPO" --bundle-from-oci
                 --predicate-type "$PRED")
-          [ -z "$SIGNER_REPO" ]    || args+=(--signer-repo "$SIGNER_REPO")
-          [ -z "$SIGNER_WORKFLOW" ] || args+=(--signer-workflow "$SIGNER_WORKFLOW")
+          # --signer-repo and --signer-workflow are in the same cert-identity
+          # flag group and are MUTUALLY EXCLUSIVE. Prefer --signer-workflow with
+          # full owner/repo path when both are provided (it carries repo identity).
+          [ -n "$SIGNER_WORKFLOW" ] && { args+=(--signer-workflow "$SIGNER_WORKFLOW"); }
+          [ -z "$SIGNER_WORKFLOW" ] && [ -n "$SIGNER_REPO" ] && args+=(--signer-repo "$SIGNER_REPO")
           [ -z "$SOURCE_REF" ]     || args+=(--source-ref "$SOURCE_REF")
           [ -z "$SOURCE_DIGEST" ]  || args+=(--source-digest "$SOURCE_DIGEST")
           gh attestation "${args[@]}"

@@ -1,3 +1,14 @@
+# attestation-gate
+#
+# Consumer-side attestation gate (promotion side of the supply chain).
+#   - Legacy mode (image tom): REST-eksistens + predicate-type-sjekk.
+#   - Strong mode (image satt): kryptografisk `gh attestation verify` mot
+#     OCI-bundlen, med forventet signer-workflow/source-ref og valgfri
+#     --source-digest (kun når en uavhengig forventet source-SHA finnes).
+# Brukes av: k8s-research `app-digest-bump.yml` (pre-PR, med --source-digest)
+#   og `validate.yml` `gate-pr` (uten --source-digest — trusted-main provenance).
+# Merknad: --signer-repo og --signer-workflow er gjensidig utelukkende; bruk
+#   --signer-workflow med full owner/repo/path når begge ellers ville gjelde.
 name: attestation-gate
 on:
   workflow_call:
@@ -14,6 +25,7 @@ on:
         required: false
         type: string
         default: "https://slsa.dev/provenance/v1"
+        description: Expected attestation predicate type
       # Strong mode (consumer-side provenance verification). When `image` is set,
       # success comes ONLY from `gh attestation verify` against the OCI bundle.
       # Legacy mode (image empty) keeps the REST existence/predicate check.
@@ -40,10 +52,12 @@ on:
     secrets:
       token:
         required: true
+        description: GitHub token for attestation lookup (strong mode) or REST API (legacy mode)
       # Registry credential for strong mode (OCI image + OCI attestation bundle).
       # PAT classic with read:packages. Legacy mode uses `token` against the GitHub API.
       registry-token:
         required: false
+        description: GHCR credential for strong mode (PAT classic with read:packages)
 permissions:
   contents: read
 jobs:

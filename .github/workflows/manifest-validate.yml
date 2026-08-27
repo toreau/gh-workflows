@@ -1,3 +1,8 @@
+# manifest-validate
+#
+# Validates Kubernetes manifests: kubeconform (schema check with optional
+# custom CRD schemas and an exclude regex) + yamllint (relaxed). Used as the
+# validate-apps/validate-argocd checks in k8s-research's `validate.yml`.
 name: manifest-validate
 on:
   workflow_call:
@@ -20,6 +25,7 @@ on:
         required: false
         type: boolean
         default: true
+        description: Run kubeconform in strict mode (reject unknown fields)
       exclude:
         required: false
         type: string

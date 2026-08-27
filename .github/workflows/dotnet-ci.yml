@@ -1,3 +1,8 @@
+# dotnet-ci
+#
+# Standard .NET restore/build/test pipeline with optional XPlat code coverage
+# collection, per-project line-rate summary, and coverage-artifact upload.
+# Used as the build-test phase of .NET app repos (e.g. toreau/astronomy.aursand.no).
 name: dotnet-ci
 on:
   workflow_call:
@@ -10,6 +15,7 @@ on:
         required: false
         type: string
         default: "global.json"
+        description: Path to global.json (SDK pin) used by setup-dotnet
       coverage:
         required: false
         type: boolean
@@ -19,6 +25,7 @@ on:
         required: false
         type: boolean
         default: true
+        description: Upload the coverage-reports artifact (when coverage is enabled)
 permissions:
   contents: read
 jobs:

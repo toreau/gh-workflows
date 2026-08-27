@@ -1,3 +1,11 @@
+# container-build-push
+#
+# Builds and pushes a container image to a registry (build side of the
+# supply chain). Uses docker/buildx for platform builds (e.g. linux/arm64)
+# and docker/login for registry auth. The pushed image (tagged per `tags`)
+# is later SLSA-attested by the caller's own workflow.
+#
+# Used by: app repos' CI (e.g. toreau/astronomy.aursand.no, toreau/frosta-historielag.no).
 name: container-build-push
 on:
   workflow_call:
@@ -14,6 +22,7 @@ on:
         required: false
         type: string
         default: "."
+        description: Build context directory (default repo root)
       platform:
         required: true
         type: string
@@ -31,9 +40,11 @@ on:
         required: false
         type: string
         default: "ghcr.io"
+        description: Registry to authenticate against and push to
     secrets:
       token:
         required: true
+        description: GitHub token with packages write scope for the target registry (GITHUB_TOKEN or PAT)
 permissions:
   contents: read
   packages: write

@@ -12,6 +12,11 @@
 # matching image line or the step fails closed. No shell/sed/awk replacement
 # programs are constructed from caller input.
 #
+# Path policy: every target path must resolve inside GITHUB_WORKSPACE, contain
+# no symlink indirection, be a regular file, and be Git-tracked. ALL targets
+# are validated (including tracked-ness and match count) before ANY file is
+# written, so a bad path can never modify a file outside the repository.
+#
 # Used by: k8s-research `app-digest-bump.yml` (open-pr mode, after the
 # attestation gate has verified the proposed digest).
 name: digest-bump
@@ -108,7 +113,13 @@ jobs:
           DIGEST: ${{ inputs.digest }}
         run: |
           python3 - <<'PY'
-          import os, re, sys
+          import os, re, subprocess, sys
+
+          workspace = os.environ.get("GITHUB_WORKSPACE")
+          if not workspace:
+              print("::error::GITHUB_WORKSPACE is not set", file=sys.stderr)
+              sys.exit(1)
+          root = os.path.realpath(workspace)
 
           digest = os.environ["DIGEST"]
           if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
@@ -123,12 +134,33 @@ jobs:
           # PREFIX is treated literally (never as regex/executable); only the
           # 64 hex chars directly after it may vary.
           image_line = re.compile(re.escape(prefix) + r"[0-9a-f]{64}")
-          changed = []
+
+          def contained(real, base):
+              return real != base and real.startswith(base + os.sep)
+
+          # Phase 1: validate every target and compute new content — NO writes yet.
+          # Policy: rooted under GITHUB_WORKSPACE, no symlink indirection, regular
+          # file, Git-tracked. All targets must pass before any file is mutated.
+          planned = []
           for f in files:
-              if not os.path.isfile(f):
-                  print(f"::error::{f} is not a file in this workspace", file=sys.stderr)
+              candidate = f if os.path.isabs(f) else os.path.join(root, f)
+              candidate = os.path.abspath(candidate)
+              real = os.path.realpath(candidate)
+              if not contained(real, root):
+                  print(f"::error::{f} resolves outside the workspace", file=sys.stderr)
                   sys.exit(1)
-              with open(f, "r", encoding="utf-8") as fh:
+              if candidate != real:
+                  print(f"::error::{f} contains a symlink (symlink paths are not allowed)", file=sys.stderr)
+                  sys.exit(1)
+              if not os.path.isfile(real):
+                  print(f"::error::{f} is not a regular file", file=sys.stderr)
+                  sys.exit(1)
+              rel = os.path.relpath(real, root)
+              if subprocess.run(["git", "ls-files", "--error-unmatch", "--", rel],
+                                capture_output=True, cwd=root).returncode != 0:
+                  print(f"::error::{f} is not a tracked file in this repository", file=sys.stderr)
+                  sys.exit(1)
+              with open(real, "r", encoding="utf-8") as fh:
                   data = fh.read()
               matches = list(image_line.finditer(data))
               if len(matches) != 1:
@@ -136,13 +168,19 @@ jobs:
                   sys.exit(1)
               m = matches[0]
               new_data = data[:m.start()] + prefix + new_digest + data[m.end():]
+              planned.append((rel, data, new_data))
+
+          # Phase 2: mutate only after every target validated.
+          changed = []
+          for rel, data, new_data in planned:
+              target = os.path.join(root, rel)
               if new_data != data:
-                  with open(f, "w", encoding="utf-8") as fh:
+                  with open(target, "w", encoding="utf-8") as fh:
                       fh.write(new_data)
-                  changed.append(f)
-                  print(f"{f}: changed")
+                  changed.append(rel)
+                  print(f"{rel}: changed")
               else:
-                  print(f"{f}: unchanged")
+                  print(f"{rel}: unchanged")
           if changed:
               print("changed=true")
               with open(os.environ["GITHUB_OUTPUT"], "a") as fh:

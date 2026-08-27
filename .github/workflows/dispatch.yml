@@ -13,10 +13,20 @@ on:
         required: false
         type: string
         default: "{}"
-        description: JSON object for client_payload
+        description: JSON object for client_payload. When hmac-secret is set, the
+          caller must provide app, sha and digest fields in this object — they are
+          bound into the HMAC-v1 signature.
     secrets:
       token:
         required: true
+      # Optional HMAC-v1 signing key. When set, the workflow injects {v, ts, sig}
+      # into client_payload so the receiver can authenticate the caller->app claim.
+      # Contract (HMAC-v1): sign canonical jq -cS of {"v":1,"app":...,"sha":...,
+      # "digest":...,"ts":<epoch>} with HMAC-SHA256 (hex). Freshness is the
+      # receiver's responsibility (now-300s <= ts <= now+60s); this is NOT replay
+      # protection without receiver-side nonce state.
+      hmac-secret:
+        required: false
 permissions:
   contents: read
 jobs:
@@ -29,7 +39,24 @@ jobs:
           TARGET: ${{ inputs.target-repo }}
           EVENT: ${{ inputs.event-type }}
           PAYLOAD: ${{ inputs.payload }}
+          HMAC_KEY: ${{ secrets.hmac-secret }}
         run: |
+          if [ -n "$HMAC_KEY" ]; then
+            # HMAC-v1: require app/sha/digest in the caller payload, add ts, sign
+            # the canonical object, then inject {v, ts, sig} into client_payload.
+            app=$(jq -r '.app // empty' <<<"$PAYLOAD")
+            sha=$(jq -r '.sha // empty' <<<"$PAYLOAD")
+            digest=$(jq -r '.digest // empty' <<<"$PAYLOAD")
+            { [ -n "$app" ] && [ -n "$sha" ] && [ -n "$digest" ]; } || {
+              echo "::error::HMAC-v1 requires app, sha and digest in payload"; exit 1;
+            }
+            ts=$(date +%s)
+            canon=$(jq -cS -n --arg v "1" --arg app "$app" --arg sha "$sha" --arg digest "$digest" --argjson ts "$ts" \
+              '{v:($v|tonumber), app:$app, sha:$sha, digest:$digest, ts:$ts}')
+            sig=$(printf '%s' "$canon" | openssl dgst -sha256 -hmac "$HMAC_KEY" | awk '{print $2}')
+            echo "hmac-v1: signed canonical=${canon} sig=${sig}"
+            PAYLOAD=$(jq -cS --argjson ts "$ts" --arg sig "$sig" '. + {v:1, ts:$ts, sig:$sig}' <<<"$PAYLOAD")
+          fi
           # -f client_payload=... sends a string, but the API expects an object;
           # build the JSON body and pipe it via --input -.
           jq -cn --arg event "$EVENT" --argjson payload "$PAYLOAD" \

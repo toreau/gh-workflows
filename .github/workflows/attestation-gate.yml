@@ -14,16 +14,69 @@ on:
         required: false
         type: string
         default: "https://slsa.dev/provenance/v1"
+      # Strong mode (consumer-side provenance verification). When `image` is set,
+      # success comes ONLY from `gh attestation verify` against the OCI bundle.
+      # Legacy mode (image empty) keeps the REST existence/predicate check.
+      image:
+        required: false
+        type: string
+        description: "Full image reference without digest, e.g. ghcr.io/toreau/frosta-historielag.no. Set to enable strong mode."
+      signer-repo:
+        required: false
+        type: string
+        description: "Expected signer repository (owner/repo), e.g. toreau/frosta-historielag.no"
+      signer-workflow:
+        required: false
+        type: string
+        description: "Expected signer workflow path (no @ref), e.g. .github/workflows/ci.yml"
+      source-ref:
+        required: false
+        type: string
+        description: "Expected source ref, e.g. refs/heads/main"
+      source-digest:
+        required: false
+        type: string
+        description: "Expected source repository commit SHA (Git SHA, NOT artifact digest). Only pass when an independently trusted expected source SHA exists (e.g. HMAC-verified dispatch sha)."
     secrets:
       token:
         required: true
+      # Registry credential for strong mode (OCI image + OCI attestation bundle).
+      # PAT classic with read:packages. Legacy mode uses `token` against the GitHub API.
+      registry-token:
+        required: false
 permissions:
   contents: read
 jobs:
   gate:
     runs-on: ubuntu-latest
     steps:
-      - name: Verify attestation exists (gate)
+      - name: Verify attestation (strong mode — OCI bundle, cryptographic)
+        if: inputs.image != ''
+        env:
+          GH_TOKEN: ${{ secrets.token }}
+          REG_TOKEN: ${{ secrets.registry-token }}
+          IMAGE: ${{ inputs.image }}
+          DIGEST: ${{ inputs.digest }}
+          OWNER_REPO: ${{ inputs.owner-repo }}
+          SIGNER_REPO: ${{ inputs.signer-repo }}
+          SIGNER_WORKFLOW: ${{ inputs.signer-workflow }}
+          SOURCE_REF: ${{ inputs.source-ref }}
+          SOURCE_DIGEST: ${{ inputs.source-digest }}
+          PRED: ${{ inputs.predicate-type }}
+        run: |
+          if [ -n "$REG_TOKEN" ]; then
+            echo "$REG_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin >/dev/null 2>&1
+          fi
+          args=(verify "oci://${IMAGE}@${DIGEST}" --repo "$OWNER_REPO" --bundle-from-oci
+                --predicate-type "$PRED")
+          [ -z "$SIGNER_REPO" ]    || args+=(--signer-repo "$SIGNER_REPO")
+          [ -z "$SIGNER_WORKFLOW" ] || args+=(--signer-workflow "$SIGNER_WORKFLOW")
+          [ -z "$SOURCE_REF" ]     || args+=(--source-ref "$SOURCE_REF")
+          [ -z "$SOURCE_DIGEST" ]  || args+=(--source-digest "$SOURCE_DIGEST")
+          gh attestation "${args[@]}"
+          echo "strong verification OK: ${IMAGE}@${DIGEST} signed by ${SIGNER_REPO}/${SIGNER_WORKFLOW} (${SOURCE_REF})"
+      - name: Verify attestation exists (legacy mode — REST existence/predicate)
+        if: inputs.image == ''
         env:
           GH_TOKEN: ${{ secrets.token }}
           REPO: ${{ inputs.owner-repo }}

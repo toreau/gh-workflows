@@ -1,3 +1,15 @@
+# dispatch
+#
+# Sends a repository_dispatch event to another repository (GitOps/promotion
+# side of the supply chain). Supports optional HMAC-v1 signing: when
+# `hmac-secret` is set, the payload is signed over the canonical object
+# {v:1, app, sha, digest, ts} (jq -cS) and {v, ts, sig} are injected into
+# client_payload so the receiver can authenticate the caller->app claim.
+# Freshness is the receiver's responsibility (now-300s <= ts <= now+60s);
+# this is NOT replay protection without receiver-side nonce state.
+#
+# Used by: app repos' CI (build + attest + dispatch), e.g.
+# toreau/astronomy.aursand.no and toreau/frosta-historielag.no.
 name: dispatch
 on:
   workflow_call:
@@ -9,6 +21,7 @@ on:
       event-type:
         required: true
         type: string
+        description: Repository_dispatch event type, e.g. app-image-pushed
       payload:
         required: false
         type: string
@@ -19,6 +32,7 @@ on:
     secrets:
       token:
         required: true
+        description: GitHub token with dispatch permission on target-repo (PAT or GITHUB_TOKEN)
       # Optional HMAC-v1 signing key. When set, the workflow injects {v, ts, sig}
       # into client_payload so the receiver can authenticate the caller->app claim.
       # Contract (HMAC-v1): sign canonical jq -cS of {"v":1,"app":...,"sha":...,
@@ -27,6 +41,7 @@ on:
       # protection without receiver-side nonce state.
       hmac-secret:
         required: false
+        description: Per-app HMAC-v1 signing key (shared with the receiver's DISPATCH_HMAC_KEYS entry)
 permissions:
   contents: read
 jobs:

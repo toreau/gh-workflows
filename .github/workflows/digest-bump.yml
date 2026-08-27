@@ -1,3 +1,13 @@
+# digest-bump
+#
+# Updates the image digest in one or more manifest files and commits/pushes
+# the change. With `open-pr: true` it pushes to a feature branch and opens
+# (or updates) a pull request instead of pushing to the base branch — the
+# review-based promotion path used by k8s-research's `app-digest-bump.yml`.
+# Tokens {digest12} {sha7} {digest} {sha} are substituted in branch/title/body.
+#
+# Used by: k8s-research `app-digest-bump.yml` (open-pr mode, after the
+# attestation gate has verified the proposed digest).
 name: digest-bump
 on:
   workflow_call:
@@ -33,10 +43,12 @@ on:
         required: false
         type: string
         default: "k8s-research bot"
+        description: Git committer/author name for the bump commit
       bot-email:
         required: false
         type: string
         default: "actions@users.noreply.github.com"
+        description: Git committer/author email for the bump commit
       open-pr:
         required: false
         type: boolean
@@ -70,6 +82,7 @@ on:
     secrets:
       token:
         required: true
+        description: GitHub token with contents:write + pull-requests:write for the target repo (PAT or GITHUB_TOKEN)
 permissions:
   contents: write
   pull-requests: write

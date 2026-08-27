@@ -2,9 +2,13 @@
 #
 # Watches pinned native dependencies in a Dockerfile and opens an issue when
 # an upstream moves to a newer tag/commit. Maintenance workflow — outside the
-# build/promotion pipeline. Uses `pins` (JSON array of
-# {name, type: tag|commit, pattern, extract, upstream}) to compare the pinned
-# value in the Dockerfile against the current upstream.
+# build/promotion pipeline.
+#
+# `pins` is DATA-ONLY configuration — a JSON array of:
+#   {name, type: "tag"|"commit", pattern, group, upstream}
+# where `pattern` is a Python regex and `group` (>= 1) selects the capture
+# group holding the pinned value. No executable fragments (shell/sed) are
+# accepted. The workflow fails closed on any invalid entry.
 name: native-pin-watcher
 on:
   workflow_call:
@@ -12,12 +16,12 @@ on:
       dockerfile:
         required: false
         type: string
-        default: "src/Astronomy.Api/Dockerfile"
-        description: Path to the Dockerfile to scan for pinned native dependencies
+        default: ""
+        description: Path to the Dockerfile to scan for pinned native dependencies (required)
       pins:
         required: true
         type: string
-        description: JSON array of {name, type (tag|commit), pattern, extract, upstream}
+        description: 'JSON array of data-only pins {name, type: tag|commit, pattern, group, upstream}; pattern is a Python regex, group >= 1 selects the capture group holding the pinned value'
       issue-title:
         required: false
         type: string
@@ -28,6 +32,10 @@ on:
         type: string
         default: ""
         description: Comma-separated labels for the opened issue
+    secrets:
+      token:
+        required: true
+        description: GitHub token with issues:write for the calling repository
 permissions:
   contents: read
   issues: write
@@ -42,36 +50,102 @@ jobs:
           DOCKERFILE: ${{ inputs.dockerfile }}
           PINS_JSON: ${{ inputs.pins }}
         run: |
-          changed_lines=()
-          echo "pinned checks:"
-          while read -r pin; do
-            [ -z "$pin" ] && continue
-            name=$(jq -r '.name' <<<"$pin")
-            ptype=$(jq -r '.type' <<<"$pin")
-            pattern=$(jq -r '.pattern' <<<"$pin")
-            extract=$(jq -r '.extract' <<<"$pin")
-            upstream=$(jq -r '.upstream' <<<"$pin")
-            pinned=$(grep -oE -e "$pattern" "$DOCKERFILE" | head -1 | sed -E "$extract")
-            if [ "$ptype" = "tag" ]; then
-              latest=$(git ls-remote --tags "https://github.com/${upstream}.git" | grep -v '\^{}' | awk -F/ '{print $NF}' | sort -V | tail -1)
-            else
-              latest=$(git ls-remote "https://github.com/${upstream}.git" HEAD | awk '{print $1}')
-            fi
-            echo "  $name: pinned=$pinned latest=$latest"
-            if [ -n "$pinned" ] && [ "$pinned" != "$latest" ]; then
-              changed_lines+=("- $name: pinned \`$pinned\` -> latest \`$latest\`")
-            fi
-          done < <(jq -c '.[]' <<<"$PINS_JSON")
-          if [ "${#changed_lines[@]}" -gt 0 ]; then
-            printf '%s\n' "${changed_lines[@]}" > /tmp/changes.txt
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "No newer native upstreams."
-          fi
+          python3 - <<'PY'
+          import json, os, re, subprocess, sys
+
+          dockerfile = os.environ["DOCKERFILE"]
+          if not dockerfile:
+              print("::error::dockerfile input is required", file=sys.stderr)
+              sys.exit(1)
+          try:
+              with open(dockerfile, "r", encoding="utf-8") as fh:
+                  lines = fh.read().splitlines()
+          except OSError as e:
+              print(f"::error::cannot read dockerfile {dockerfile}: {e}", file=sys.stderr)
+              sys.exit(1)
+          try:
+              pins = json.loads(os.environ["PINS_JSON"])
+          except json.JSONDecodeError as e:
+              print(f"::error::pins is not valid JSON: {e}", file=sys.stderr)
+              sys.exit(1)
+          if not isinstance(pins, list):
+              print("::error::pins must be a JSON array", file=sys.stderr)
+              sys.exit(1)
+
+          def version_key(tag):
+              # Approximates `sort -V`: numeric runs compare as ints, the rest as strings.
+              return [int(part) if part.isdigit() else part for part in re.split(r"([0-9]+)", tag)]
+
+          results = []
+          for i, pin in enumerate(pins):
+              name = pin.get("name")
+              ptype = pin.get("type")
+              pattern = pin.get("pattern")
+              group = pin.get("group")
+              upstream = pin.get("upstream")
+              missing = [k for k, v in (
+                  ("name", name), ("type", ptype), ("pattern", pattern),
+                  ("group", group), ("upstream", upstream),
+              ) if v in (None, "")]
+              if missing:
+                  print(f"::error::pin[{i}] missing required field(s): {', '.join(missing)}", file=sys.stderr)
+                  sys.exit(1)
+              if ptype not in ("tag", "commit"):
+                  print(f"::error::pin[{i}] '{name}': type must be 'tag' or 'commit', got '{ptype}'", file=sys.stderr)
+                  sys.exit(1)
+              if isinstance(group, bool) or not isinstance(group, int) or group < 1:
+                  print(f"::error::pin[{i}] '{name}': group must be a positive integer", file=sys.stderr)
+                  sys.exit(1)
+              try:
+                  rx = re.compile(pattern)
+              except re.error as e:
+                  print(f"::error::pin[{i}] '{name}': invalid regex: {e}", file=sys.stderr)
+                  sys.exit(1)
+              if group > rx.groups:
+                  print(f"::error::pin[{i}] '{name}': capture group {group} does not exist (pattern has {rx.groups} group(s))", file=sys.stderr)
+                  sys.exit(1)
+              m = None
+              for line in lines:
+                  m = rx.search(line)
+                  if m:
+                      break
+              if m is None:
+                  print(f"::error::pin[{i}] '{name}': no match for pattern in {dockerfile}", file=sys.stderr)
+                  sys.exit(1)
+              pinned = m.group(group)
+              if not pinned:
+                  print(f"::error::pin[{i}] '{name}': capture group {group} matched an empty value", file=sys.stderr)
+                  sys.exit(1)
+              results.append({"name": name, "type": ptype, "pinned": pinned, "upstream": upstream})
+
+          print("pinned checks:")
+          changed_lines = []
+          for pin in results:
+              # upstream is used only as a URL argument to git ls-remote (no shell).
+              repo_url = f"https://github.com/{pin['upstream']}.git"
+              if pin["type"] == "tag":
+                  proc = subprocess.run(["git", "ls-remote", "--tags", repo_url], capture_output=True, text=True)
+                  tags = [ln.split("/")[-1] for ln in proc.stdout.splitlines() if not ln.endswith("^{}")]
+                  latest = sorted(tags, key=version_key)[-1] if tags else ""
+              else:
+                  proc = subprocess.run(["git", "ls-remote", repo_url, "HEAD"], capture_output=True, text=True)
+                  latest = proc.stdout.split()[0] if proc.stdout.split() else ""
+              print(f"  {pin['name']}: pinned={pin['pinned']} latest={latest}")
+              if pin["pinned"] and latest and pin["pinned"] != latest:
+                  changed_lines.append(f"- {pin['name']}: pinned `{pin['pinned']}` -> latest `{latest}`")
+          if changed_lines:
+              with open("/tmp/changes.txt", "w", encoding="utf-8") as fh:
+                  fh.write("\n".join(changed_lines) + "\n")
+              with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
+                  fh.write("changed=true\n")
+              print("changed=true")
+          else:
+              print("No newer native upstreams.")
+          PY
       - name: Open issue when an upstream moved
         if: steps.check.outputs.changed == 'true'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.token }}
           TITLE: ${{ inputs.issue-title }}
           LABELS: ${{ inputs.labels }}
         run: |

@@ -3,6 +3,15 @@
 # Validates Kubernetes manifests: kubeconform (schema check with optional
 # custom CRD schemas and an exclude regex) + yamllint (relaxed). Used as the
 # validate-apps/validate-argocd checks in k8s-research's `validate.yml`.
+#
+# Supply-chain determinism: kubeconform is pinned to an exact version and its
+# archive is SHA-256 verified before extraction; yamllint is pinned to an exact
+# version; schema resolution is pinned to a `kubernetes-version` (default
+# 1.34.3) instead of silently following upstream's mutable `master` schema.
+#
+# Note: -ignore-missing-schemas means kinds WITHOUT an available schema are
+# SKIPPED, not validated. "strict" only tightens field checking for kinds that
+# DO have schemas — it does not imply every kind is validated.
 name: manifest-validate
 on:
   workflow_call:
@@ -31,6 +40,11 @@ on:
         type: string
         default: ""
         description: Regex of file paths to exclude from kubeconform (passed to -ignore-filename-pattern), e.g. 'apps/.*/meta\.yaml$'
+      kubernetes-version:
+        required: false
+        type: string
+        default: "1.34.3"
+        description: Kubernetes version for kubeconform schema resolution (deterministic; default matches the target cluster baseline)
 permissions:
   contents: read
 jobs:
@@ -38,9 +52,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-      - name: Install kubeconform
+      - name: Install kubeconform (pinned + checksum-verified)
+        env:
+          KUBECONFORM_VERSION: "v0.8.0"
+          KUBECONFORM_SHA256: "9bc2bffbf71f261128533edaf912153948b7ff238f9a531ae6d34466ec287883"
         run: |
-          curl -sSLo /tmp/kubeconform.tar.gz https://github.com/yannh/kubeconform/releases/download/v0.8.0/kubeconform-linux-amd64.tar.gz
+          curl -sSLo /tmp/kubeconform.tar.gz \
+            "https://github.com/yannh/kubeconform/releases/download/${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz"
+          echo "${KUBECONFORM_SHA256}  /tmp/kubeconform.tar.gz" | sha256sum -c -
           tar xzf /tmp/kubeconform.tar.gz -C /tmp
       - name: kubeconform paths
         env:
@@ -48,6 +67,7 @@ jobs:
           SCHEMAS_DIR: ${{ inputs.schemas-dir }}
           STRICT: ${{ inputs.strict }}
           EXCLUDE: ${{ inputs.exclude }}
+          KUBE_VERSION: ${{ inputs.kubernetes-version }}
         run: |
           schemas_arg=()
           if [ -n "$SCHEMAS_DIR" ]; then
@@ -59,16 +79,19 @@ jobs:
           if [ -n "$EXCLUDE" ]; then exclude_arg=(-ignore-filename-pattern "$EXCLUDE"); fi
           for p in $PATHS; do
             echo "::group::kubeconform $p"
+            # -ignore-missing-schemas: kinds without a schema are SKIPPED, not
+            # validated (strict only tightens checking for kinds that have one).
             /tmp/kubeconform "${strict_arg[@]}" -ignore-missing-schemas \
+              -kubernetes-version "$KUBE_VERSION" \
               -schema-location default "${schemas_arg[@]}" "${exclude_arg[@]}" "$p"
             echo "::endgroup::"
           done
-      - name: yamllint paths
+      - name: yamllint paths (pinned version)
         env:
           PATHS: ${{ inputs.paths }}
           YAMLLINT_PATHS: ${{ inputs.yamllint-paths }}
         run: |
-          pip install --quiet yamllint
+          pip install --quiet 'yamllint==1.38.0'
           for p in $PATHS $YAMLLINT_PATHS; do
             echo "::group::yamllint $p"
             yamllint -d relaxed "$p"

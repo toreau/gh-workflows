@@ -2,13 +2,15 @@
 #
 # Consumer-side attestation gate (promotion side of the supply chain).
 #   - Legacy mode (image tom): REST-eksistens + predicate-type-sjekk.
-#   - Strong mode (image satt): kryptografisk `gh attestation verify` mot
-#     OCI-bundlen, med forventet signer-workflow/source-ref og valgfri
-#     --source-digest (kun når en uavhengig forventet source-SHA finnes).
+#   - Strong mode (image satt): kryptografisk `gh attestation verify --bundle-from-oci`
+#     mot attestasjons-bundlen i OCI-registryet (IKKE GitHub API-et). Fail-closed:
+#     krever nøyaktig én av signer-repo/signer-workflow og et source-ref.
+#     Valgfri --source-digest = forventet source-commit-SHA (Git SHA, aldri
+#     artefakt-digest), kun når en uavhengig forventet source-SHA finnes.
 # Brukes av: k8s-research `app-digest-bump.yml` (pre-PR, med --source-digest)
 #   og `validate.yml` `gate-pr` (uten --source-digest — trusted-main provenance).
-# Merknad: --signer-repo og --signer-workflow er gjensidig utelukkende; bruk
-#   --signer-workflow med full owner/repo/path når begge ellers ville gjelde.
+# Merknad: --signer-repo og --signer-workflow er gjensidig utelukkende; å sende
+#   begge er en konfigurasjonsfeil og stopper steget.
 name: attestation-gate
 on:
   workflow_call:
@@ -27,8 +29,9 @@ on:
         default: "https://slsa.dev/provenance/v1"
         description: Expected attestation predicate type
       # Strong mode (consumer-side provenance verification). When `image` is set,
-      # success comes ONLY from `gh attestation verify` against the OCI bundle.
-      # Legacy mode (image empty) keeps the REST existence/predicate check.
+      # success comes ONLY from `gh attestation verify` against the OCI bundle
+      # (fetched with --bundle-from-oci). Legacy mode (image empty) keeps the
+      # REST existence/predicate check.
       image:
         required: false
         type: string
@@ -36,15 +39,15 @@ on:
       signer-repo:
         required: false
         type: string
-        description: "Expected signer repository (owner/repo), e.g. toreau/frosta-historielag.no. Mutually exclusive with signer-workflow."
+        description: "Expected signer repository (owner/repo), e.g. toreau/frosta-historielag.no. Mutually exclusive with signer-workflow. Exactly one of the two is REQUIRED in strong mode."
       signer-workflow:
         required: false
         type: string
-        description: "Expected signer workflow with FULL owner/repo path (no @ref), e.g. toreau/frosta-historielag.no/.github/workflows/ci.yml. Mutually exclusive with signer-repo."
+        description: "Expected signer workflow with FULL owner/repo path (no @ref), e.g. toreau/frosta-historielag.no/.github/workflows/ci.yml. Mutually exclusive with signer-repo. Exactly one of the two is REQUIRED in strong mode."
       source-ref:
         required: false
         type: string
-        description: "Expected source ref, e.g. refs/heads/main"
+        description: "Expected source ref, e.g. refs/heads/main. REQUIRED in strong mode."
       source-digest:
         required: false
         type: string
@@ -52,7 +55,7 @@ on:
     secrets:
       token:
         required: true
-        description: GitHub token for attestation lookup (strong mode) or REST API (legacy mode)
+        description: GitHub token for verification trust lookups (strong mode) / attestation REST API (legacy mode). With --bundle-from-oci the bundle is fetched from the OCI registry, not the GitHub API.
       # Registry credential for strong mode (OCI image + OCI attestation bundle).
       # PAT classic with read:packages. Legacy mode uses `token` against the GitHub API.
       registry-token:
@@ -78,16 +81,26 @@ jobs:
           SOURCE_DIGEST: ${{ inputs.source-digest }}
           PRED: ${{ inputs.predicate-type }}
         run: |
+          # Fail-closed strong-mode contract: exactly one signer constraint and
+          # a source-ref are REQUIRED. Misconfiguration stops the gate.
+          if [ -n "$SIGNER_REPO" ] && [ -n "$SIGNER_WORKFLOW" ]; then
+            echo "::error::signer-repo and signer-workflow are mutually exclusive"; exit 1
+          fi
+          if [ -z "$SIGNER_REPO" ] && [ -z "$SIGNER_WORKFLOW" ]; then
+            echo "::error::strong mode requires exactly one of signer-repo or signer-workflow"; exit 1
+          fi
+          if [ -z "$SOURCE_REF" ]; then
+            echo "::error::strong mode requires source-ref"; exit 1
+          fi
           if [ -n "$REG_TOKEN" ]; then
             echo "$REG_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin >/dev/null 2>&1
           fi
+          # --bundle-from-oci fetches the attestation bundle from the OCI registry;
+          # --repo/--signer-*/--source-* are policy/identity constraints.
           args=(verify "oci://${IMAGE}@${DIGEST}" --repo "$OWNER_REPO" --bundle-from-oci
                 --predicate-type "$PRED")
-          # --signer-repo and --signer-workflow are in the same cert-identity
-          # flag group and are MUTUALLY EXCLUSIVE. Prefer --signer-workflow with
-          # full owner/repo path when both are provided (it carries repo identity).
-          [ -n "$SIGNER_WORKFLOW" ] && { args+=(--signer-workflow "$SIGNER_WORKFLOW"); }
-          [ -z "$SIGNER_WORKFLOW" ] && [ -n "$SIGNER_REPO" ] && args+=(--signer-repo "$SIGNER_REPO")
+          [ -n "$SIGNER_WORKFLOW" ] && args+=(--signer-workflow "$SIGNER_WORKFLOW")
+          [ -n "$SIGNER_REPO" ]      && args+=(--signer-repo "$SIGNER_REPO")
           [ -z "$SOURCE_REF" ]     || args+=(--source-ref "$SOURCE_REF")
           [ -z "$SOURCE_DIGEST" ]  || args+=(--source-digest "$SOURCE_DIGEST")
           gh attestation "${args[@]}"

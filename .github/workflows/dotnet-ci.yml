@@ -3,6 +3,9 @@
 # Standard .NET restore/build/test pipeline with optional XPlat code coverage
 # collection, per-project line-rate summary, and coverage-artifact upload.
 # Used as the build-test phase of .NET app repos (e.g. toreau/astronomy.aursand.no).
+#
+# Input safety: `solution` is passed via env and quoted as data in every shell
+# command — never interpolated directly into a run script.
 name: dotnet-ci
 on:
   workflow_call:
@@ -31,19 +34,30 @@ permissions:
 jobs:
   build-test:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68  # v6.0.0
         with:
           global-json-file: ${{ inputs.global-json-file }}
-      - run: dotnet restore ${{ inputs.solution }}
-      - run: dotnet build ${{ inputs.solution }} -c Release --no-restore
+      - name: Restore
+        env:
+          SOLUTION: ${{ inputs.solution }}
+        run: dotnet restore "$SOLUTION"
+      - name: Build
+        env:
+          SOLUTION: ${{ inputs.solution }}
+        run: dotnet build "$SOLUTION" -c Release --no-restore
       - name: Test with coverage
         if: inputs.coverage
-        run: dotnet test ${{ inputs.solution }} -c Release --no-build --collect:"XPlat Code Coverage" --results-directory coverage-results
+        env:
+          SOLUTION: ${{ inputs.solution }}
+        run: dotnet test "$SOLUTION" -c Release --no-build --collect:"XPlat Code Coverage" --results-directory coverage-results
       - name: Test
         if: ${{ ! inputs.coverage }}
-        run: dotnet test ${{ inputs.solution }} -c Release --no-build
+        env:
+          SOLUTION: ${{ inputs.solution }}
+        run: dotnet test "$SOLUTION" -c Release --no-build
       - name: Summarize coverage
         if: inputs.coverage
         run: |

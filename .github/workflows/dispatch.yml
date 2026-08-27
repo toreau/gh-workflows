@@ -8,6 +8,10 @@
 # Freshness is the receiver's responsibility (now-300s <= ts <= now+60s);
 # this is NOT replay protection without receiver-side nonce state.
 #
+# The HMAC signature is a valid authenticator for the exact payload within the
+# freshness window and is NEVER logged; only the canonical (non-secret) fields
+# are echoed.
+#
 # Used by: app repos' CI (build + attest + dispatch), e.g.
 # toreau/astronomy.aursand.no and toreau/frosta-historielag.no.
 name: dispatch
@@ -32,7 +36,7 @@ on:
     secrets:
       token:
         required: true
-        description: GitHub token with dispatch permission on target-repo (PAT or GITHUB_TOKEN)
+        description: Credential with write access to target-repo (e.g. a PAT). Cross-repository dispatch requires a credential scoped to target-repo; an ordinary repository-scoped GITHUB_TOKEN cannot dispatch to another repository.
       # Optional HMAC-v1 signing key. When set, the workflow injects {v, ts, sig}
       # into client_payload so the receiver can authenticate the caller->app claim.
       # Contract (HMAC-v1): sign canonical jq -cS of {"v":1,"app":...,"sha":...,
@@ -42,8 +46,7 @@ on:
       hmac-secret:
         required: false
         description: Per-app HMAC-v1 signing key (shared with the receiver's DISPATCH_HMAC_KEYS entry)
-permissions:
-  contents: read
+permissions: {}
 jobs:
   dispatch:
     runs-on: ubuntu-latest
@@ -69,7 +72,8 @@ jobs:
             canon=$(jq -cS -n --arg v "1" --arg app "$app" --arg sha "$sha" --arg digest "$digest" --argjson ts "$ts" \
               '{v:($v|tonumber), app:$app, sha:$sha, digest:$digest, ts:$ts}')
             sig=$(printf '%s' "$canon" | openssl dgst -sha256 -hmac "$HMAC_KEY" | awk '{print $2}')
-            echo "hmac-v1: signed canonical=${canon} sig=${sig}"
+            # Signature is an authenticator for the payload — never log it.
+            echo "hmac-v1: signed canonical=${canon}"
             PAYLOAD=$(jq -cS --argjson ts "$ts" --arg sig "$sig" '. + {v:1, ts:$ts, sig:$sig}' <<<"$PAYLOAD")
           fi
           # -f client_payload=... sends a string, but the API expects an object;

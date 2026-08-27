@@ -9,15 +9,17 @@
 # where `pattern` is a Python regex and `group` (>= 1) selects the capture
 # group holding the pinned value. No executable fragments (shell/sed) are
 # accepted. The workflow fails closed on any invalid entry.
+#
+# Fail-closed upstream checks: an unreachable upstream (git ls-remote error or
+# timeout) is a FAILURE with ::error:: — it is never reported as "no update".
 name: native-pin-watcher
 on:
   workflow_call:
     inputs:
       dockerfile:
-        required: false
+        required: true
         type: string
-        default: ""
-        description: Path to the Dockerfile to scan for pinned native dependencies (required)
+        description: Path to the Dockerfile to scan for pinned native dependencies
       pins:
         required: true
         type: string
@@ -122,14 +124,26 @@ jobs:
           changed_lines = []
           for pin in results:
               # upstream is used only as a URL argument to git ls-remote (no shell).
+              # "Cannot check upstream" (error OR timeout) is a FAILURE, never
+              # interpreted as "no newer upstream".
               repo_url = f"https://github.com/{pin['upstream']}.git"
-              if pin["type"] == "tag":
-                  proc = subprocess.run(["git", "ls-remote", "--tags", repo_url], capture_output=True, text=True)
-                  tags = [ln.split("/")[-1] for ln in proc.stdout.splitlines() if not ln.endswith("^{}")]
-                  latest = sorted(tags, key=version_key)[-1] if tags else ""
-              else:
-                  proc = subprocess.run(["git", "ls-remote", repo_url, "HEAD"], capture_output=True, text=True)
-                  latest = proc.stdout.split()[0] if proc.stdout.split() else ""
+              try:
+                  if pin["type"] == "tag":
+                      proc = subprocess.run(["git", "ls-remote", "--tags", repo_url], capture_output=True, text=True, timeout=30)
+                      if proc.returncode != 0:
+                          print(f"::error::{pin['name']}: git ls-remote failed: {proc.stderr.strip()}", file=sys.stderr)
+                          sys.exit(1)
+                      tags = [ln.split("/")[-1] for ln in proc.stdout.splitlines() if not ln.endswith("^{}")]
+                      latest = sorted(tags, key=version_key)[-1] if tags else ""
+                  else:
+                      proc = subprocess.run(["git", "ls-remote", repo_url, "HEAD"], capture_output=True, text=True, timeout=30)
+                      if proc.returncode != 0:
+                          print(f"::error::{pin['name']}: git ls-remote failed: {proc.stderr.strip()}", file=sys.stderr)
+                          sys.exit(1)
+                      latest = proc.stdout.split()[0] if proc.stdout.split() else ""
+              except subprocess.TimeoutExpired:
+                  print(f"::error::{pin['name']}: git ls-remote timed out", file=sys.stderr)
+                  sys.exit(1)
               print(f"  {pin['name']}: pinned={pin['pinned']} latest={latest}")
               if pin["pinned"] and latest and pin["pinned"] != latest:
                   changed_lines.append(f"- {pin['name']}: pinned `{pin['pinned']}` -> latest `{latest}`")

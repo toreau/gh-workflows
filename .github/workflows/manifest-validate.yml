@@ -20,6 +20,11 @@ on:
         required: false
         type: boolean
         default: true
+      exclude:
+        required: false
+        type: string
+        default: ""
+        description: Regex of file paths to exclude from kubeconform (passed to -exclude), e.g. 'apps/.*/meta\.yaml$'
 permissions:
   contents: read
 jobs:
@@ -36,6 +41,7 @@ jobs:
           PATHS: ${{ inputs.paths }}
           SCHEMAS_DIR: ${{ inputs.schemas-dir }}
           STRICT: ${{ inputs.strict }}
+          EXCLUDE: ${{ inputs.exclude }}
         run: |
           schemas_arg=()
           if [ -n "$SCHEMAS_DIR" ]; then
@@ -43,10 +49,12 @@ jobs:
           fi
           strict_arg=()
           if [ "$STRICT" = "true" ]; then strict_arg=(-strict); fi
+          exclude_arg=()
+          if [ -n "$EXCLUDE" ]; then exclude_arg=(-exclude "$EXCLUDE"); fi
           for p in $PATHS; do
             echo "::group::kubeconform $p"
             /tmp/kubeconform "${strict_arg[@]}" -ignore-missing-schemas \
-              -schema-location default "${schemas_arg[@]}" "$p"
+              -schema-location default "${schemas_arg[@]}" "${exclude_arg[@]}" "$p"
             echo "::endgroup::"
           done
       - name: yamllint paths

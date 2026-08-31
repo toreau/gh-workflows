@@ -1,44 +1,46 @@
 # container-build-attest
 #
-# Platform-owned trusted builder (SLSA Build L3-oriented design, S3 contract).
-# The platform builder builds the artifact, derives the exact digest, and
-# generates the provenance/SBOM attestations. The caller supplies NO inputs:
-# the caller identity (github.repository) selects a platform-owned build profile
-# embedded in this immutable revision. The caller only supplies the token.
+# Platform-owned trusted builder (generic mechanism, SLSA Build L3-oriented).
+# The caller supplies NO workflow_call inputs and NO secrets: the caller's
+# automatic github.token is used internally, and application-specific build
+# configuration is read from the FIXED path `.github/container-build.json` in
+# the caller's exact source revision (the same github.sha the build uses).
+#
+# This file contains NO application-specific knowledge and NO hardcoded
+# repository/org names. A new application only adds its own
+# `.github/container-build.json`; gh-workflows is never edited per application.
 #
 # Trust-boundary invariants (by construction):
-#   - no caller-controlled inputs (no image/tags/runner/digest/subject/signer);
-#   - caller must be an authorized repo AND github.ref == refs/heads/main
-#     (explicit fail-closed step, never a benign skip);
+#   - no caller inputs/secrets (no image/tags/runner/digest/subject/signer);
+#   - source-ref policy: caller github.ref == refs/heads/main (fail-closed);
+#   - descriptor and Dockerfile/context come from the SAME caller commit
+#     (checkout pinned to github.sha in both validate/config and build);
+#   - descriptor is UNTRUSTED caller-controlled data: parsed safely
+#     (jq -e/r, string-typed, control chars rejected) before any output/shell use;
+#   - generic image policy: ghcr.io + namespace == lowercase(github.repository_owner)
+#     (owner restriction, NOT per-application authorization; end-to-end app
+#     authorization stays with GHCR package permissions + consumer policy);
 #   - build job has no id-token / no attestations (signing material unreachable
 #     from user-defined build steps);
-#   - SBOM generation runs WITHOUT signing capability (separate job, packages:read);
-#   - signing job is minimal: fresh runner, no checkout, no build, no SBOM tool,
-#     only actions/attest over the builder-derived IMAGE@DIGEST;
+#   - SBOM generation runs WITHOUT signing capability (separate job);
+#   - signing job is minimal: no checkout, no build, no SBOM tool;
 #   - no shared, writable cross-run build cache (no cache-from/cache-to);
-#   - digest comes directly from docker/build-push-action output, never a tag
-#     lookup, never caller-supplied;
-#   - the attest job independently confirms IMAGE@DIGEST exists in GHCR before
-#     signing (defense in depth: existence + image binding, not a claim about
-#     which build pushed it).
+#   - digest comes directly from docker/build-push-action output;
+#   - attest job independently confirms IMAGE@DIGEST exists (defense in depth).
 #
-# Only the canonical `main-<caller-sha>` tag is generated (no `latest`).
-# Deployment identity is the digest; tags are not trust-bearing.
+# Only `main-<caller-sha>` is generated (no latest). Deployment identity is the
+# digest.
 #
 # Producer-side `gh attestation verify` is a CONSISTENCY check (fail-fast),
-# not consumer enforcement and not a trust boundary.
+# not consumer enforcement. It self-identifies via the reusable job context
+# (job.workflow_ref / job.workflow_sha), so no org/path is hardcoded here.
 #
-# S3 = implementation candidate. S4 must verify the resulting identity
-# (SAN, signer workflow/digest, source repo/ref/digest, OCI bundle, runner
-# claims, provenance completeness) against THIS workflow before S5 freezes it.
+# S3.1 = corrective slice; S4 must verify the resulting identity and
+# provenance completeness against the new builder revision before S5 freezes it.
 name: container-build-attest
 
 on:
   workflow_call:
-    secrets:
-      token:
-        required: true
-        description: Caller GITHUB_TOKEN with packages:write (registry push + OCI attestation push)
     outputs:
       digest:
         description: Exact immutable image digest produced by the trusted build (sha256:<64 hex>)
@@ -48,60 +50,75 @@ permissions:
   contents: read
 
 jobs:
-  validate-policy:
+  validate-config:
     runs-on: ubuntu-24.04
     permissions:
       contents: read
     outputs:
-      image: ${{ steps.policy.outputs.image }}
-      dockerfile: ${{ steps.policy.outputs.dockerfile }}
-      context: ${{ steps.policy.outputs.context }}
-      platform: ${{ steps.policy.outputs.platform }}
-      runner: ${{ steps.policy.outputs.runner }}
-      tag: ${{ steps.policy.outputs.tag }}
+      image: ${{ steps.config.outputs.image }}
+      dockerfile: ${{ steps.config.outputs.dockerfile }}
+      context: ${{ steps.config.outputs.context }}
+      platform: ${{ steps.config.outputs.platform }}
+      runner: ${{ steps.config.outputs.runner }}
+      tag: ${{ steps.config.outputs.tag }}
     steps:
-      - name: Validate caller profile + source ref (fail-closed)
-        id: policy
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+      - name: Read + validate build descriptor (fail-closed, untrusted source data)
+        id: config
         env:
           GITHUB_REPOSITORY: ${{ github.repository }}
           GITHUB_REF: ${{ github.ref }}
           GITHUB_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          # Platform-owned caller -> build profile (immutable, same revision as
-          # this workflow). Not fetched from any mutable ref.
-          PROFILE='{
-            "toreau/frosta-historielag.no": {
-              "image": "ghcr.io/toreau/frosta-historielag.no",
-              "dockerfile": "Dockerfile",
-              "context": ".",
-              "platform": "linux/arm64",
-              "runner": "ubuntu-24.04-arm"
-            },
-            "toreau/astronomy.aursand.no": {
-              "image": "ghcr.io/toreau/astronomy-api",
-              "dockerfile": "src/Astronomy.Api/Dockerfile",
-              "context": ".",
-              "platform": "linux/arm64",
-              "runner": "ubuntu-24.04-arm"
-            }
-          }'
-          p=$(printf '%s' "$PROFILE" | jq -r --arg r "$GITHUB_REPOSITORY" '.[$r] // empty')
-          if [ -z "$p" ]; then
-            echo "::error::caller repository '$GITHUB_REPOSITORY' is not authorized for the trusted builder"
-            exit 1
-          fi
           if [ "$GITHUB_REF" != "refs/heads/main" ]; then
             echo "::error::trusted builder requires caller ref refs/heads/main, got '$GITHUB_REF'"
             exit 1
           fi
-          image=$(printf '%s' "$p" | jq -r .image)
-          dockerfile=$(printf '%s' "$p" | jq -r .dockerfile)
-          context=$(printf '%s' "$p" | jq -r .context)
-          platform=$(printf '%s' "$p" | jq -r .platform)
-          runner=$(printf '%s' "$p" | jq -r .runner)
+          DESC=".github/container-build.json"
+          [ -f "$DESC" ] || { echo "::error::missing $DESC in caller source"; exit 1; }
+          if ! jq -e 'type == "object"' "$DESC" >/dev/null; then
+            echo "::error::$DESC must be a JSON object"; exit 1
+          fi
+          # Descriptor is caller-controlled: require string-typed fields and
+          # reject control characters before any output/shell use.
+          get_str() {
+            jq -er --arg k "$1" '.[$k] | strings' "$DESC" 2>/dev/null
+          }
+          image=$(get_str image)    || { echo "::error::$DESC .image must be a string"; exit 1; }
+          dockerfile=$(get_str dockerfile) || { echo "::error::$DESC .dockerfile must be a string"; exit 1; }
+          context=$(get_str context) || { echo "::error::$DESC .context must be a string"; exit 1; }
+          platform=$(get_str platform) || { echo "::error::$DESC .platform must be a string"; exit 1; }
+          for v in "$image" "$dockerfile" "$context" "$platform"; do
+            [ -n "$v" ] || { echo "::error::empty descriptor value"; exit 1; }
+            if printf '%s' "$v" | LC_ALL=C grep -q '[[:cntrl:]]'; then
+              echo "::error::control characters not allowed in descriptor value"; exit 1
+            fi
+          done
+          # Generic image policy: ghcr.io + namespace == lowercase(owner).
+          OWNER=$(printf '%s' "$GITHUB_REPOSITORY" | cut -d/ -f1 | tr '[:upper:]' '[:lower:]')
+          case "$image" in
+            ghcr.io/*) ;;
+            *) echo "::error::image must be ghcr.io/<owner>/<package>"; exit 1 ;;
+          esac
+          rest="${image#ghcr.io/}"
+          ns="${rest%%/*}"
+          pkg="${rest#*/}"
+          [ -n "$ns" ] && [ -n "$pkg" ] || { echo "::error::invalid image identity '$image'"; exit 1; }
+          if [ "$ns" != "$OWNER" ]; then
+            echo "::error::image namespace '$ns' does not match owner '$OWNER'"; exit 1
+          fi
+          case "$pkg" in
+            */*) echo "::error::nested package paths are not supported; use ghcr.io/<owner>/<package>"; exit 1 ;;
+            *:*|*@*) echo "::error::image must not contain a tag or digest"; exit 1 ;;
+            *[!a-z0-9._-]*) echo "::error::invalid package name '$pkg'"; exit 1 ;;
+          esac
+          # Platform -> approved GitHub-hosted runner (internal mapping, never caller input).
           case "$platform" in
-            linux/amd64|linux/arm64) ;;
+            linux/amd64) RUNNER="ubuntu-24.04" ;;
+            linux/arm64) RUNNER="ubuntu-24.04-arm" ;;
             *) echo "::error::unsupported platform '$platform'"; exit 1 ;;
           esac
           {
@@ -109,14 +126,14 @@ jobs:
             echo "dockerfile=$dockerfile"
             echo "context=$context"
             echo "platform=$platform"
-            echo "runner=$runner"
+            echo "runner=$RUNNER"
             echo "tag=$image:main-$GITHUB_SHA"
           } >> "$GITHUB_OUTPUT"
-          echo "profile OK: $GITHUB_REPOSITORY -> $image ($platform, $runner)"
+          echo "config OK: $image ($platform, $RUNNER)"
 
   build:
-    needs: validate-policy
-    runs-on: ${{ needs.validate-policy.outputs.runner }}
+    needs: validate-config
+    runs-on: ${{ needs.validate-config.outputs.runner }}
     permissions:
       contents: read
       packages: write
@@ -124,11 +141,13 @@ jobs:
       digest: ${{ steps.build.outputs.digest }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ github.sha }}
       - name: Validate build paths (inside checkout, fail-closed)
         env:
           WS: ${{ github.workspace }}
-          DOCKERFILE: ${{ needs.validate-policy.outputs.dockerfile }}
-          CONTEXT: ${{ needs.validate-policy.outputs.context }}
+          DOCKERFILE: ${{ needs.validate-config.outputs.dockerfile }}
+          CONTEXT: ${{ needs.validate-config.outputs.context }}
         run: |
           set -euo pipefail
           require_inside() {
@@ -138,8 +157,6 @@ jobs:
               /*) echo "::error::$label must be a relative path inside the checkout"; exit 1 ;;
             esac
             local abs="$WS/$p"
-            # realpath follows symlinks and requires existence; containment
-            # against the checked-out workspace is the builder filesystem boundary.
             local real
             real=$(realpath "$abs") || { echo "::error::cannot resolve $label '$p'"; exit 1; }
             case "$real" in
@@ -156,19 +173,18 @@ jobs:
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
-          password: ${{ secrets.token }}
+          password: ${{ github.token }}
       - id: build
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a  # v7.3.0
         with:
-          context: ${{ needs.validate-policy.outputs.context }}
-          file: ${{ needs.validate-policy.outputs.dockerfile }}
-          platforms: ${{ needs.validate-policy.outputs.platform }}
+          context: ${{ needs.validate-config.outputs.context }}
+          file: ${{ needs.validate-config.outputs.dockerfile }}
+          platforms: ${{ needs.validate-config.outputs.platform }}
           push: true
-          tags: ${{ needs.validate-policy.outputs.tag }}
+          tags: ${{ needs.validate-config.outputs.tag }}
           provenance: false
           sbom: false
-          # No cache-from/cache-to: the trusted builder introduces no shared,
-          # writable cross-run build cache (SLSA Build L3 isolation invariant).
+          # No cache-from/cache-to: no shared, writable cross-run build cache.
       - name: Validate digest format (fail-closed)
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
@@ -182,7 +198,7 @@ jobs:
           echo "digest format OK: $DIGEST"
 
   sbom:
-    needs: [validate-policy, build]
+    needs: [validate-config, build]
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -192,11 +208,11 @@ jobs:
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
-          password: ${{ secrets.token }}
+          password: ${{ github.token }}
       - name: Generate SBOM against immutable digest
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610  # v0.24.0
         with:
-          image: ${{ needs.validate-policy.outputs.image }}@${{ needs.build.outputs.digest }}
+          image: ${{ needs.validate-config.outputs.image }}@${{ needs.build.outputs.digest }}
           format: spdx-json
           output-file: report.spdx.json
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
@@ -206,7 +222,7 @@ jobs:
           if-no-files-found: error
 
   attest:
-    needs: [validate-policy, build, sbom]
+    needs: [validate-config, build, sbom]
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -221,10 +237,10 @@ jobs:
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
-          password: ${{ secrets.token }}
+          password: ${{ github.token }}
       - name: Confirm immutable artifact exists in GHCR (defense in depth)
         env:
-          IMAGE: ${{ needs.validate-policy.outputs.image }}
+          IMAGE: ${{ needs.validate-config.outputs.image }}
           DIGEST: ${{ needs.build.outputs.digest }}
         run: |
           set -euo pipefail
@@ -238,26 +254,36 @@ jobs:
       - name: Attest build provenance
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6  # v4
         with:
-          subject-name: ${{ needs.validate-policy.outputs.image }}
+          subject-name: ${{ needs.validate-config.outputs.image }}
           subject-digest: ${{ needs.build.outputs.digest }}
           push-to-registry: true
       - name: Attest SBOM
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6  # v4
         with:
-          subject-name: ${{ needs.validate-policy.outputs.image }}
+          subject-name: ${{ needs.validate-config.outputs.image }}
           subject-digest: ${{ needs.build.outputs.digest }}
           sbom-path: report.spdx.json
           push-to-registry: true
-      - name: Producer-side consistency check (not a trust boundary)
+      - name: Producer-side consistency check (not a trust boundary, self-identifying)
         env:
-          GH_TOKEN: ${{ secrets.token }}
-          IMAGE: ${{ needs.validate-policy.outputs.image }}
+          GH_TOKEN: ${{ github.token }}
+          JOB_JSON: ${{ toJSON(job) }}
+          IMAGE: ${{ needs.validate-config.outputs.image }}
           DIGEST: ${{ needs.build.outputs.digest }}
           REPO: ${{ github.repository }}
           SRC_SHA: ${{ github.sha }}
         run: |
+          set -euo pipefail
+          # Self-identify the reusable workflow that defines this job via the
+          # job context (no org/repo hardcoded): workflow_ref = owner/repo/.github/workflows/<file>.yml@ref
+          wf_ref=$(printf '%s' "$JOB_JSON" | jq -r '.workflow_ref // empty')
+          wf_sha=$(printf '%s' "$JOB_JSON" | jq -r '.workflow_sha // empty')
+          [ -n "$wf_ref" ] || { echo "::error::job.workflow_ref not present"; exit 1; }
+          [ -n "$wf_sha" ] || { echo "::error::job.workflow_sha not present"; exit 1; }
+          signer="${wf_ref%@*}"
+          echo "producer verify: signer-workflow=$signer signer-digest=$wf_sha"
           gh attestation verify "oci://${IMAGE}@${DIGEST}" --repo "$REPO" --bundle-from-oci \
-            --signer-workflow toreau/gh-workflows/.github/workflows/container-build-attest.yml \
+            --signer-workflow "$signer" --signer-digest "$wf_sha" \
             --source-ref refs/heads/main --source-digest "$SRC_SHA" \
             --predicate-type https://slsa.dev/provenance/v1
           echo "producer consistency OK: ${IMAGE}@${DIGEST}"

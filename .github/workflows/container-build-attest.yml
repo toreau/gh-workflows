@@ -93,6 +93,10 @@ jobs:
           platform=$(get_str platform) || { echo "::error::$DESC .platform must be a string"; exit 1; }
           for v in "$image" "$dockerfile" "$context" "$platform"; do
             [ -n "$v" ] || { echo "::error::empty descriptor value"; exit 1; }
+            case "$v" in
+              *$'\n'*|*$'\r'*)
+                echo "::error::newline or carriage return not allowed in descriptor value"; exit 1 ;;
+            esac
             if printf '%s' "$v" | LC_ALL=C grep -q '[[:cntrl:]]'; then
               echo "::error::control characters not allowed in descriptor value"; exit 1
             fi

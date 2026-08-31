@@ -1,0 +1,26 @@
+# actionlint
+#
+# S2-owned source-acceptance check: lints all reusable workflows in this
+# repository (the future builder/provenance trust anchor). Runs on PRs and
+# pushes to main. Its exact check context ("actionlint") is required by the
+# main-protection ruleset.
+name: actionlint
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  actionlint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download actionlint
+        id: get_actionlint
+        run: bash <(curl https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
+      - name: Lint workflows
+        run: ${{ steps.get_actionlint.outputs.executable }} -color

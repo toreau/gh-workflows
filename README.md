@@ -32,7 +32,7 @@ Reusable GitHub Actions workflows shared across repos. Callers use these via
 
 | Workflow | What it does | Key inputs / secrets |
 | --- | --- | --- |
-| `attestation-gate.yml` | Consumer-side attestation gate. Legacy mode = REST existence + predicate type. Strong mode = cryptographic `gh attestation verify --bundle-from-oci` with expected signer-workflow/source-ref (optional `--source-digest`). | `owner-repo`, `digest`, `image` (strong), `signer-workflow`, `source-ref`, `source-digest` · secrets `token`, `registry-token` |
+| `attestation-gate.yml` | Consumer-side attestation gate. Legacy mode = REST existence + predicate type. Strong mode = cryptographic `gh attestation verify --bundle-from-oci` with expected signer-workflow/source-ref (optional `--source-digest`). Revision mode = strong mode + explicit trusted signer-digest set (JSON array; one complete PASS among N trusted revisions authorizes, zero = fail-closed, no path-only fallback). | `owner-repo`, `digest`, `image` (strong), `signer-workflow`, `source-ref`, `source-digest`, `trusted-signer-digests-json`, `require-signer-digest`, `deny-self-hosted-runners` · secrets `token`, `registry-token` |
 | `digest-bump.yml` | Bumps an image digest in manifests; commit/push, or open/update a PR (`open-pr: true`). Token substitution in branch/title/body. | `file-paths`, `image-prefix`, `digest`, `sha`, `open-pr`, `head-branch`, `pr-title` · secret `token` |
 | `dispatch.yml` | Sends a `repository_dispatch` event; optional HMAC-v1 signing of the payload. | `target-repo`, `event-type`, `payload` · secrets `token`, `hmac-secret` |
 

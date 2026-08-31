@@ -1,0 +1,263 @@
+# container-build-attest
+#
+# Platform-owned trusted builder (SLSA Build L3-oriented design, S3 contract).
+# The platform builder builds the artifact, derives the exact digest, and
+# generates the provenance/SBOM attestations. The caller supplies NO inputs:
+# the caller identity (github.repository) selects a platform-owned build profile
+# embedded in this immutable revision. The caller only supplies the token.
+#
+# Trust-boundary invariants (by construction):
+#   - no caller-controlled inputs (no image/tags/runner/digest/subject/signer);
+#   - caller must be an authorized repo AND github.ref == refs/heads/main
+#     (explicit fail-closed step, never a benign skip);
+#   - build job has no id-token / no attestations (signing material unreachable
+#     from user-defined build steps);
+#   - SBOM generation runs WITHOUT signing capability (separate job, packages:read);
+#   - signing job is minimal: fresh runner, no checkout, no build, no SBOM tool,
+#     only actions/attest over the builder-derived IMAGE@DIGEST;
+#   - no shared, writable cross-run build cache (no cache-from/cache-to);
+#   - digest comes directly from docker/build-push-action output, never a tag
+#     lookup, never caller-supplied;
+#   - the attest job independently confirms IMAGE@DIGEST exists in GHCR before
+#     signing (defense in depth: existence + image binding, not a claim about
+#     which build pushed it).
+#
+# Only the canonical `main-<caller-sha>` tag is generated (no `latest`).
+# Deployment identity is the digest; tags are not trust-bearing.
+#
+# Producer-side `gh attestation verify` is a CONSISTENCY check (fail-fast),
+# not consumer enforcement and not a trust boundary.
+#
+# S3 = implementation candidate. S4 must verify the resulting identity
+# (SAN, signer workflow/digest, source repo/ref/digest, OCI bundle, runner
+# claims, provenance completeness) against THIS workflow before S5 freezes it.
+name: container-build-attest
+
+on:
+  workflow_call:
+    secrets:
+      token:
+        required: true
+        description: Caller GITHUB_TOKEN with packages:write (registry push + OCI attestation push)
+    outputs:
+      digest:
+        description: Exact immutable image digest produced by the trusted build (sha256:<64 hex>)
+        value: ${{ jobs.attest.outputs.digest }}
+
+permissions:
+  contents: read
+
+jobs:
+  validate-policy:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      image: ${{ steps.policy.outputs.image }}
+      dockerfile: ${{ steps.policy.outputs.dockerfile }}
+      context: ${{ steps.policy.outputs.context }}
+      platform: ${{ steps.policy.outputs.platform }}
+      runner: ${{ steps.policy.outputs.runner }}
+      tag: ${{ steps.policy.outputs.tag }}
+    steps:
+      - name: Validate caller profile + source ref (fail-closed)
+        id: policy
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_REF: ${{ github.ref }}
+          GITHUB_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          # Platform-owned caller -> build profile (immutable, same revision as
+          # this workflow). Not fetched from any mutable ref.
+          PROFILE='{
+            "toreau/frosta-historielag.no": {
+              "image": "ghcr.io/toreau/frosta-historielag.no",
+              "dockerfile": "Dockerfile",
+              "context": ".",
+              "platform": "linux/arm64",
+              "runner": "ubuntu-24.04-arm"
+            },
+            "toreau/astronomy.aursand.no": {
+              "image": "ghcr.io/toreau/astronomy-api",
+              "dockerfile": "src/Astronomy.Api/Dockerfile",
+              "context": ".",
+              "platform": "linux/arm64",
+              "runner": "ubuntu-24.04-arm"
+            }
+          }'
+          p=$(printf '%s' "$PROFILE" | jq -r --arg r "$GITHUB_REPOSITORY" '.[$r] // empty')
+          if [ -z "$p" ]; then
+            echo "::error::caller repository '$GITHUB_REPOSITORY' is not authorized for the trusted builder"
+            exit 1
+          fi
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "::error::trusted builder requires caller ref refs/heads/main, got '$GITHUB_REF'"
+            exit 1
+          fi
+          image=$(printf '%s' "$p" | jq -r .image)
+          dockerfile=$(printf '%s' "$p" | jq -r .dockerfile)
+          context=$(printf '%s' "$p" | jq -r .context)
+          platform=$(printf '%s' "$p" | jq -r .platform)
+          runner=$(printf '%s' "$p" | jq -r .runner)
+          case "$platform" in
+            linux/amd64|linux/arm64) ;;
+            *) echo "::error::unsupported platform '$platform'"; exit 1 ;;
+          esac
+          {
+            echo "image=$image"
+            echo "dockerfile=$dockerfile"
+            echo "context=$context"
+            echo "platform=$platform"
+            echo "runner=$runner"
+            echo "tag=$image:main-$GITHUB_SHA"
+          } >> "$GITHUB_OUTPUT"
+          echo "profile OK: $GITHUB_REPOSITORY -> $image ($platform, $runner)"
+
+  build:
+    needs: validate-policy
+    runs-on: ${{ needs.validate-policy.outputs.runner }}
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - name: Validate build paths (inside checkout, fail-closed)
+        env:
+          WS: ${{ github.workspace }}
+          DOCKERFILE: ${{ needs.validate-policy.outputs.dockerfile }}
+          CONTEXT: ${{ needs.validate-policy.outputs.context }}
+        run: |
+          set -euo pipefail
+          require_inside() {
+            local p="$1" label="$2"
+            [ -n "$p" ] || { echo "::error::$label is empty"; exit 1; }
+            case "$p" in
+              /*) echo "::error::$label must be a relative path inside the checkout"; exit 1 ;;
+            esac
+            local abs="$WS/$p"
+            # realpath follows symlinks and requires existence; containment
+            # against the checked-out workspace is the builder filesystem boundary.
+            local real
+            real=$(realpath "$abs") || { echo "::error::cannot resolve $label '$p'"; exit 1; }
+            case "$real" in
+              "$WS"|"$WS"/*) ;;
+              *) echo "::error::$label '$p' resolves outside the checkout workspace"; exit 1 ;;
+            esac
+            echo "$label OK: $real"
+          }
+          require_inside "$DOCKERFILE" dockerfile
+          require_inside "$CONTEXT" context
+          echo "build paths OK"
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e  # v4.3.0
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.token }}
+      - id: build
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a  # v7.3.0
+        with:
+          context: ${{ needs.validate-policy.outputs.context }}
+          file: ${{ needs.validate-policy.outputs.dockerfile }}
+          platforms: ${{ needs.validate-policy.outputs.platform }}
+          push: true
+          tags: ${{ needs.validate-policy.outputs.tag }}
+          provenance: false
+          sbom: false
+          # No cache-from/cache-to: the trusted builder introduces no shared,
+          # writable cross-run build cache (SLSA Build L3 isolation invariant).
+      - name: Validate digest format (fail-closed)
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          hex="${DIGEST#sha256:}"
+          if [ "$hex" = "$DIGEST" ] || ! printf '%s' "$hex" | grep -Eq '^[0-9a-f]{64}$'; then
+            echo "::error::invalid build digest '$DIGEST'"
+            exit 1
+          fi
+          echo "digest format OK: $DIGEST"
+
+  sbom:
+    needs: [validate-policy, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.token }}
+      - name: Generate SBOM against immutable digest
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610  # v0.24.0
+        with:
+          image: ${{ needs.validate-policy.outputs.image }}@${{ needs.build.outputs.digest }}
+          format: spdx-json
+          output-file: report.spdx.json
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: sbom
+          path: report.spdx.json
+          if-no-files-found: error
+
+  attest:
+    needs: [validate-policy, build, sbom]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    outputs:
+      digest: ${{ needs.build.outputs.digest }}
+    steps:
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e  # v4.3.0
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.token }}
+      - name: Confirm immutable artifact exists in GHCR (defense in depth)
+        env:
+          IMAGE: ${{ needs.validate-policy.outputs.image }}
+          DIGEST: ${{ needs.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          ref="${IMAGE}@${DIGEST}"
+          docker buildx imagetools inspect "$ref" --format '{{.Name}}@{{.Manifest.Digest}}' \
+            || { echo "::error::$ref not found in registry"; exit 1; }
+          echo "confirmed: $ref"
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          name: sbom
+      - name: Attest build provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6  # v4
+        with:
+          subject-name: ${{ needs.validate-policy.outputs.image }}
+          subject-digest: ${{ needs.build.outputs.digest }}
+          push-to-registry: true
+      - name: Attest SBOM
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6  # v4
+        with:
+          subject-name: ${{ needs.validate-policy.outputs.image }}
+          subject-digest: ${{ needs.build.outputs.digest }}
+          sbom-path: report.spdx.json
+          push-to-registry: true
+      - name: Producer-side consistency check (not a trust boundary)
+        env:
+          GH_TOKEN: ${{ secrets.token }}
+          IMAGE: ${{ needs.validate-policy.outputs.image }}
+          DIGEST: ${{ needs.build.outputs.digest }}
+          REPO: ${{ github.repository }}
+          SRC_SHA: ${{ github.sha }}
+        run: |
+          gh attestation verify "oci://${IMAGE}@${DIGEST}" --repo "$REPO" --bundle-from-oci \
+            --signer-workflow toreau/gh-workflows/.github/workflows/container-build-attest.yml \
+            --source-ref refs/heads/main --source-digest "$SRC_SHA" \
+            --predicate-type https://slsa.dev/provenance/v1
+          echo "producer consistency OK: ${IMAGE}@${DIGEST}"

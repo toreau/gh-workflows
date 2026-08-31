@@ -25,6 +25,7 @@ Reusable GitHub Actions workflows shared across repos. Callers use these via
 | Workflow | What it does | Key inputs / secrets |
 | --- | --- | --- |
 | `container-build-push.yml` | Builds and pushes a container image (buildx, platform e.g. arm64), docker login. Image is later SLSA-attested by the caller. | `image`, `dockerfile`, `platform`, `tags`, `runner` · secret `token` (packages:write) |
+| `container-build-attest.yml` | **Trusted builder** (S3): no caller inputs — caller identity selects a platform-owned build profile (image/dockerfile/platform/runner). Builds, derives the exact digest, generates provenance+SBOM attestations (SBOM in a separate non-signing job), returns only `digest`. | no inputs · secret `token` |
 | `dotnet-ci.yml` | .NET restore/build/test with optional XPlat coverage + artifact upload. | `solution`, `coverage`, `upload-artifacts`, `global-json-file` |
 
 ### Promotion & gate

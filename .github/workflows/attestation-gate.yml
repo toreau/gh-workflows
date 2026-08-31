@@ -1,16 +1,25 @@
 # attestation-gate
 #
 # Consumer-side attestation gate (promotion side of the supply chain).
-#   - Legacy mode (image tom): REST-eksistens + predicate-type-sjekk.
-#   - Strong mode (image satt): kryptografisk `gh attestation verify --bundle-from-oci`
-#     mot attestasjons-bundlen i OCI-registryet (IKKE GitHub API-et). Fail-closed:
-#     krever nøyaktig én av signer-repo/signer-workflow og et source-ref.
-#     Valgfri --source-digest = forventet source-commit-SHA (Git SHA, aldri
-#     artefakt-digest), kun når en uavhengig forventet source-SHA finnes.
+#   - Legacy REST mode (image empty): REST-eksistens + predicate-type-sjekk.
+#   - Strong mode (image set): kryptografisk `gh attestation verify --bundle-from-oci`
+#     mot attestasjons-bundlen i OCI-registryet (IKKE GitHub API-et).
+#   - Revision mode (trusted-signer-digests-json satt): strong mode med eksplisitt
+#     signer-revisjons-memberskap. For hver betrodd revisjon kjøres KOMPLETT
+#     verifikasjon med `--signer-digest <rev>`; én full PASS = ACCEPT; ingen = FAIL.
+#
+# Fail-closed mode-selection: dersom `require-signer-digest=true` ELLER
+# `trusted-signer-digests-json != ""` ELLER `deny-self-hosted-runners=true`,
+# kreves strong OCI mode (image + signer-workflow, uten signer-repo) — slik at
+# revisions-/deny-input aldri kan falle gjennom til legacy REST-grenen.
+# `trusted-signer-digests-json="[]"` betyr revisions-modus med ugyldig tomt
+# trust-sett → FAIL (aldri legacy-fallback), uavhengig av require-flagget.
+#
+# `--deny-self-hosted-runners` gjelder attestasjonsjobben (der actions/attest
+# kjørte); det beviser IKKE hvilken runner build-jobben brukte.
+#
 # Brukes av: k8s-research `app-digest-bump.yml` (pre-PR, med --source-digest)
 #   og `validate.yml` `gate-pr` (uten --source-digest — trusted-main provenance).
-# Merknad: --signer-repo og --signer-workflow er gjensidig utelukkende; å sende
-#   begge er en konfigurasjonsfeil og stopper steget.
 name: attestation-gate
 on:
   workflow_call:
@@ -28,22 +37,18 @@ on:
         type: string
         default: "https://slsa.dev/provenance/v1"
         description: Expected attestation predicate type
-      # Strong mode (consumer-side provenance verification). When `image` is set,
-      # success comes ONLY from `gh attestation verify` against the OCI bundle
-      # (fetched with --bundle-from-oci). Legacy mode (image empty) keeps the
-      # REST existence/predicate check.
       image:
         required: false
         type: string
-        description: "Full image reference without digest, e.g. ghcr.io/<org>/<repo-name>. Set to enable strong mode."
+        description: "Full image reference without digest, e.g. ghcr.io/<org>/<repo-name>. Set to enable strong OCI mode."
       signer-repo:
         required: false
         type: string
-        description: "Expected signer repository (owner/repo), e.g. <org>/<repo-name>. Mutually exclusive with signer-workflow. Exactly one of the two is REQUIRED in strong mode."
+        description: "Expected signer repository (owner/repo), e.g. <org>/<repo-name>. Mutually exclusive with signer-workflow. Exactly one of the two is REQUIRED in strong mode (legacy)."
       signer-workflow:
         required: false
         type: string
-        description: "Expected signer workflow with FULL owner/repo path (no @ref), e.g. <org>/<repo-name>/.github/workflows/ci.yml. Mutually exclusive with signer-repo. Exactly one of the two is REQUIRED in strong mode."
+        description: "Expected signer workflow with FULL owner/repo path (no @ref), e.g. <org>/<repo-name>/.github/workflows/ci.yml. Mutually exclusive with signer-repo. REQUIRED in revision/deny mode; exactly one of the two REQUIRED in legacy strong mode."
       source-ref:
         required: false
         type: string
@@ -52,6 +57,22 @@ on:
         required: false
         type: string
         description: "Expected source repository commit SHA (Git SHA, NOT artifact digest). Only pass when an independently trusted expected source SHA exists (e.g. HMAC-verified dispatch sha)."
+      # Revision mode: explicit set of trusted signer (builder) revisions.
+      trusted-signer-digests-json:
+        required: false
+        type: string
+        default: ""
+        description: 'JSON array of exact lowercase 40-hex builder revision SHAs to accept, e.g. ["373df751..."]. Non-empty input = revision mode requested (enforced); "" = not supplied. Malformed or empty array fails closed.'
+      require-signer-digest:
+        required: false
+        type: boolean
+        default: false
+        description: "When true, trusted-signer-digests-json is REQUIRED (non-empty, valid); strong S7 consumer path always sets true. Enforcing revisions never falls back to path-only verification."
+      deny-self-hosted-runners:
+        required: false
+        type: boolean
+        default: false
+        description: "Forward --deny-self-hosted-runners to gh attestation verify. Constrains the attestation-producing job, not the separate build job."
     secrets:
       token:
         required: true
@@ -67,8 +88,8 @@ jobs:
   gate:
     runs-on: ubuntu-latest
     steps:
-      - name: Verify attestation (strong mode — OCI bundle, cryptographic)
-        if: inputs.image != ''
+      - name: Verify attestation (strong mode — OCI bundle, cryptographic; optional revision enforcement)
+        if: inputs.image != '' || inputs.trusted-signer-digests-json != '' || inputs.require-signer-digest || inputs.deny-self-hosted-runners
         env:
           GH_TOKEN: ${{ secrets.token }}
           REG_TOKEN: ${{ secrets.registry-token }}
@@ -80,33 +101,103 @@ jobs:
           SOURCE_REF: ${{ inputs.source-ref }}
           SOURCE_DIGEST: ${{ inputs.source-digest }}
           PRED: ${{ inputs.predicate-type }}
+          REV_JSON: ${{ inputs.trusted-signer-digests-json }}
+          REQUIRE_REV: ${{ inputs.require-signer-digest }}
+          DENY_SELF_HOSTED: ${{ inputs.deny-self-hosted-runners }}
         run: |
-          # Fail-closed strong-mode contract: exactly one signer constraint and
-          # a source-ref are REQUIRED. Misconfiguration stops the gate.
-          if [ -n "$SIGNER_REPO" ] && [ -n "$SIGNER_WORKFLOW" ]; then
-            echo "::error::signer-repo and signer-workflow are mutually exclusive"; exit 1
+          set -euo pipefail
+
+          # --- Mode selection (fail-closed, before any branch). Revision/deny
+          # input must never fall through to the legacy REST path.
+          revision_requested=0
+          if [ "$REV_JSON" != "" ]; then
+            revision_requested=1
           fi
-          if [ -z "$SIGNER_REPO" ] && [ -z "$SIGNER_WORKFLOW" ]; then
-            echo "::error::strong mode requires exactly one of signer-repo or signer-workflow"; exit 1
+          if [ "$REQUIRE_REV" = "true" ] || [ "$revision_requested" -eq 1 ] || [ "$DENY_SELF_HOSTED" = "true" ]; then
+            [ -n "$IMAGE" ] || { echo "::error::revision/deny mode requires strong OCI mode (image must be set)"; exit 1; }
+            [ -n "$SIGNER_WORKFLOW" ] || { echo "::error::revision/deny mode requires signer-workflow"; exit 1; }
+            [ -z "$SIGNER_REPO" ] || { echo "::error::signer-repo must not be set with signer-workflow/revision mode"; exit 1; }
+          fi
+
+          # --- Revisions: parse + enforce when requested; never ignore empty/malformed.
+          revisions=()
+          if [ "$revision_requested" -eq 1 ]; then
+            if ! printf '%s' "$REV_JSON" | jq -e 'type == "array" and length > 0' >/dev/null 2>&1; then
+              echo "::error::trusted-signer-digests-json must be a non-empty JSON array of SHAs"; exit 1
+            fi
+            if ! printf '%s' "$REV_JSON" | jq -e 'all(.[]; type == "string" and test("^[0-9a-f]{40}$"))' >/dev/null 2>&1; then
+              echo "::error::every trusted signer digest must be an exact lowercase 40-hex SHA"; exit 1
+            fi
+            n=$(printf '%s' "$REV_JSON" | jq 'length')
+            u=$(printf '%s' "$REV_JSON" | jq '[.[]] | unique | length')
+            if [ "$n" -ne "$u" ]; then
+              echo "::error::duplicate trusted signer digest in trusted-signer-digests-json"; exit 1
+            fi
+            mapfile -t revisions < <(printf '%s' "$REV_JSON" | jq -r '.[]')
+          else
+            if [ "$REQUIRE_REV" = "true" ]; then
+              echo "::error::require-signer-digest=true but no trusted-signer-digests-json supplied"; exit 1
+            fi
+          fi
+
+          if [ -n "$REG_TOKEN" ]; then
+            echo "$REG_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin >/dev/null 2>&1
+          fi
+
+          # --- Legacy strong contract (no revision mode): exactly one signer
+          # constraint + source-ref.
+          if [ "$revision_requested" -eq 0 ]; then
+            if [ -n "$SIGNER_REPO" ] && [ -n "$SIGNER_WORKFLOW" ]; then
+              echo "::error::signer-repo and signer-workflow are mutually exclusive"; exit 1
+            fi
+            if [ -z "$SIGNER_REPO" ] && [ -z "$SIGNER_WORKFLOW" ]; then
+              echo "::error::strong mode requires exactly one of signer-repo or signer-workflow"; exit 1
+            fi
           fi
           if [ -z "$SOURCE_REF" ]; then
             echo "::error::strong mode requires source-ref"; exit 1
           fi
-          if [ -n "$REG_TOKEN" ]; then
-            echo "$REG_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin >/dev/null 2>&1
+
+          # --- Complete verification with all supplied constraints. Each
+          # candidate revision must be part of the full invocation.
+          run_verify() {
+            local -a args=(verify "oci://${IMAGE}@${DIGEST}" --repo "$OWNER_REPO" --bundle-from-oci --predicate-type "$PRED")
+            [ -n "$SIGNER_WORKFLOW" ] && args+=(--signer-workflow "$SIGNER_WORKFLOW")
+            [ -n "$SIGNER_REPO" ] && args+=(--signer-repo "$SIGNER_REPO")
+            [ -z "$SOURCE_REF" ] || args+=(--source-ref "$SOURCE_REF")
+            [ -z "$SOURCE_DIGEST" ] || args+=(--source-digest "$SOURCE_DIGEST")
+            if [ "$DENY_SELF_HOSTED" = "true" ]; then
+              args+=(--deny-self-hosted-runners)
+            fi
+            if [ $# -gt 0 ]; then
+              args+=("$@")
+            fi
+            gh attestation "${args[@]}"
+          }
+
+          if [ "$revision_requested" -eq 1 ]; then
+            ok=0
+            for rev in "${revisions[@]}"; do
+              echo "gate: verifying against trusted revision ${rev}"
+              if run_verify --signer-digest "$rev"; then
+                ok=1
+                echo "gate: ACCEPT via trusted revision ${rev}"
+                break
+              else
+                echo "gate: revision ${rev} did not verify (diagnostic only; trying next)"
+              fi
+            done
+            if [ "$ok" -ne 1 ]; then
+              echo "::error::no trusted signer revision verified (zero complete PASS)"; exit 1
+            fi
+          else
+            if ! run_verify; then
+              echo "::error::strong verification failed"; exit 1
+            fi
+            echo "strong verification OK: ${IMAGE}@${DIGEST} signed by ${SIGNER_REPO}/${SIGNER_WORKFLOW} (${SOURCE_REF})"
           fi
-          # --bundle-from-oci fetches the attestation bundle from the OCI registry;
-          # --repo/--signer-*/--source-* are policy/identity constraints.
-          args=(verify "oci://${IMAGE}@${DIGEST}" --repo "$OWNER_REPO" --bundle-from-oci
-                --predicate-type "$PRED")
-          [ -n "$SIGNER_WORKFLOW" ] && args+=(--signer-workflow "$SIGNER_WORKFLOW")
-          [ -n "$SIGNER_REPO" ]      && args+=(--signer-repo "$SIGNER_REPO")
-          [ -z "$SOURCE_REF" ]     || args+=(--source-ref "$SOURCE_REF")
-          [ -z "$SOURCE_DIGEST" ]  || args+=(--source-digest "$SOURCE_DIGEST")
-          gh attestation "${args[@]}"
-          echo "strong verification OK: ${IMAGE}@${DIGEST} signed by ${SIGNER_REPO}/${SIGNER_WORKFLOW} (${SOURCE_REF})"
       - name: Verify attestation exists (legacy mode — REST existence/predicate)
-        if: inputs.image == ''
+        if: inputs.image == '' && inputs.trusted-signer-digests-json == '' && ! inputs.require-signer-digest && ! inputs.deny-self-hosted-runners
         env:
           GH_TOKEN: ${{ secrets.token }}
           REPO: ${{ inputs.owner-repo }}

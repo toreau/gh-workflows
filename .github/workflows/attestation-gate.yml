@@ -18,7 +18,7 @@ on:
       owner-repo:
         required: true
         type: string
-        description: Owner/repo whose attestations to query, e.g. toreau/astronomy.aursand.no
+        description: Owner/repo whose attestations to query, e.g. <org>/<repo-name>
       digest:
         required: true
         type: string
@@ -35,15 +35,15 @@ on:
       image:
         required: false
         type: string
-        description: "Full image reference without digest, e.g. ghcr.io/toreau/frosta-historielag.no. Set to enable strong mode."
+        description: "Full image reference without digest, e.g. ghcr.io/<org>/<repo-name>. Set to enable strong mode."
       signer-repo:
         required: false
         type: string
-        description: "Expected signer repository (owner/repo), e.g. toreau/frosta-historielag.no. Mutually exclusive with signer-workflow. Exactly one of the two is REQUIRED in strong mode."
+        description: "Expected signer repository (owner/repo), e.g. <org>/<repo-name>. Mutually exclusive with signer-workflow. Exactly one of the two is REQUIRED in strong mode."
       signer-workflow:
         required: false
         type: string
-        description: "Expected signer workflow with FULL owner/repo path (no @ref), e.g. toreau/frosta-historielag.no/.github/workflows/ci.yml. Mutually exclusive with signer-repo. Exactly one of the two is REQUIRED in strong mode."
+        description: "Expected signer workflow with FULL owner/repo path (no @ref), e.g. <org>/<repo-name>/.github/workflows/ci.yml. Mutually exclusive with signer-repo. Exactly one of the two is REQUIRED in strong mode."
       source-ref:
         required: false
         type: string

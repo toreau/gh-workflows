@@ -12,8 +12,8 @@
 # freshness window and is NEVER logged; only the canonical (non-secret) fields
 # are echoed.
 #
-# Used by: app repos' CI (build + attest + dispatch), e.g.
-# toreau/astronomy.aursand.no and toreau/frosta-historielag.no.
+# Used by: app repos' CI (build + attest + dispatch), e.g. <org>/<repo-name>.
+#
 name: dispatch
 on:
   workflow_call:

@@ -35,7 +35,7 @@ on:
       image-prefix:
         required: true
         type: string
-        description: 'Image line prefix to replace, e.g. "image: ghcr.io/toreau/astronomy-api@sha256:" (matched literally)'
+        description: 'Image line prefix to replace, e.g. "image: ghcr.io/<org>/<repo-name>@sha256:" (matched literally)'
       digest:
         required: true
         type: string

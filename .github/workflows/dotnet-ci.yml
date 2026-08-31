@@ -2,7 +2,7 @@
 #
 # Standard .NET restore/build/test pipeline with optional XPlat code coverage
 # collection, per-project line-rate summary, and coverage-artifact upload.
-# Used as the build-test phase of .NET app repos (e.g. toreau/astronomy.aursand.no).
+# Used as the build-test phase of .NET app repos (e.g. <org>/<repo-name>).
 #
 # Input safety: `solution` is passed via env and quoted as data in every shell
 # command — never interpolated directly into a run script.

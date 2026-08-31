@@ -11,7 +11,8 @@
 # actions/attest model — a single authoritative mechanism, no implicit second
 # BuildKit provenance.
 #
-# Used by: app repos' CI (e.g. toreau/astronomy.aursand.no, toreau/frosta-historielag.no).
+# Used by: app repos' CI (e.g. <org>/<repo-name>).
+#
 name: container-build-push
 on:
   workflow_call:
@@ -19,7 +20,7 @@ on:
       image:
         required: true
         type: string
-        description: Full GHCR image name, e.g. ghcr.io/toreau/astronomy-api (must be ghcr.io/<owner>/<repo>)
+        description: Full GHCR image name, e.g. ghcr.io/<org>/<repo-name>
       dockerfile:
         required: true
         type: string

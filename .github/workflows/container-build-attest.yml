@@ -106,7 +106,10 @@ jobs:
           rest="${image#ghcr.io/}"
           ns="${rest%%/*}"
           pkg="${rest#*/}"
-          [ -n "$ns" ] && [ -n "$pkg" ] || { echo "::error::invalid image identity '$image'"; exit 1; }
+          if [ -z "$ns" ] || [ -z "$pkg" ]; then
+            echo "::error::invalid image identity '$image'"
+            exit 1
+          fi
           if [ "$ns" != "$OWNER" ]; then
             echo "::error::image namespace '$ns' does not match owner '$OWNER'"; exit 1
           fi

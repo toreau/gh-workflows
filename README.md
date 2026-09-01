@@ -24,7 +24,6 @@ Reusable GitHub Actions workflows shared across repos. Callers use these via
 
 | Workflow | What it does | Key inputs / secrets |
 | --- | --- | --- |
-| `container-build-push.yml` | Builds and pushes a container image (buildx, platform e.g. arm64), docker login. Image is later SLSA-attested by the caller. | `image`, `dockerfile`, `platform`, `tags`, `runner` · secret `token` (packages:write) |
 | `container-build-attest.yml` | **Trusted builder** (generic): no caller inputs/secrets — build config is read from `.github/container-build.json` in the caller's exact source revision. Validates (main-only, ghcr.io + owner namespace, supported platform→runner), builds, derives the exact digest, generates provenance+SBOM attestations (SBOM in a separate non-signing job), returns only `digest`. Uses caller `github.token`. | no inputs, no secrets · caller ceiling: `contents:read, packages:write, id-token:write, attestations:write` |
 | `dotnet-ci.yml` | .NET restore/build/test with optional XPlat coverage + artifact upload. | `solution`, `coverage`, `upload-artifacts`, `global-json-file` |
 
@@ -64,8 +63,9 @@ Reusable GitHub Actions workflows shared across repos. Callers use these via
 - `toreau/k8s-research` — thin callers in `.github/workflows/`:
   `app-digest-bump.yml` (attestation-gate → digest-bump), `validate.yml`
   (manifest-validate → gate-pr).
-- App repos (`toreau/astronomy.aursand.no`, `toreau/frosta-historielag.no`) —
-  `ci.yml` (dotnet-ci / container-build-push + attest inline + dispatch).
+- App repos: thin `ci.yml` callers around the trusted
+  `container-build-attest` workflow (`build-test -> builder -> dispatch`);
+  reference implementation: `toreau/frosta-historielag.no`.
 
 ## Adding a workflow
 

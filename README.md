@@ -1,7 +1,8 @@
 # toreau/gh-workflows
 
-Reusable GitHub Actions workflows shared across repos. Callers use these via
-`uses: toreau/gh-workflows/.github/workflows/<name>.yml@v1`.
+Reusable GitHub Actions workflows shared across repos. Production callers
+reference them by immutable full commit SHA:
+`uses: toreau/gh-workflows/.github/workflows/<name>.yml@<full-commit-sha>`.
 
 > **This repository must stay public.** Private reusable workflows cannot be
 > used across repos under a personal account (same-owner private→private
@@ -10,11 +11,15 @@ Reusable GitHub Actions workflows shared across repos. Callers use these via
 
 ## Versioning & release
 
-- Callers pin the **`v1`** tag — a **mutable ref** (a trusted, centrally
-  administered channel, part of the trust model). Dependabot keeps caller refs
-  fresh.
-- To publish a change: open a PR → merge → fast-forward the `v1` tag to the
-  new HEAD.
+- Production callers reference reusable workflows by immutable full commit
+  SHA. A workflow change is adopted by a caller through a reviewed SHA update.
+- `v1` is a legacy/compatibility tag, not the production execution-trust
+  mechanism. Moving tags may be used for compatibility or update discovery,
+  but production callers execute reviewed full commit SHAs.
+- Dependabot may propose updates to ordinary GitHub Actions/reusable-workflow
+  SHA pins; a proposal is not approval. Security-decision refs such as the
+  trusted builder and attestation gate are kept out of ordinary Dependabot
+  adoption and change only through their explicit evidence/trust lifecycle.
 - New workflow files must sit at the repo root of `.github/workflows/`
   (subdirectories are unsupported by GitHub).
 
@@ -71,5 +76,6 @@ Reusable GitHub Actions workflows shared across repos. Callers use these via
 
 1. Add the file + header comment + full descriptions.
 2. Run `actionlint`.
-3. Open a PR, merge, fast-forward `v1`.
-4. (Optional) wire a thin caller in a consuming repo and verify end-to-end.
+3. Open a PR and merge through protected `main`.
+4. When adopting the workflow, reference the reviewed merge/full commit SHA
+   from the consuming repo and verify end-to-end where appropriate.

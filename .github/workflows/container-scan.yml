@@ -1,0 +1,211 @@
+# container-scan
+#
+# Central reusable final-container vulnerability scan (generic mechanism).
+# Evaluates an immutable remote OCI artifact (IMAGE@DIGEST) with Trivy under a
+# fixed HIGH,CRITICAL policy, before automated promotion.
+#
+# Trust/invariant model (by construction):
+#   - security object is the exact validated GHCR IMAGE@DIGEST; a mutable tag
+#     is never accepted as an input or decision identity;
+#   - fixed policy owned here: vulnerability-only scan (--scanners vuln),
+#     severities HIGH and CRITICAL (explicit list; never HIGH alone),
+#     package types os+library, unfixed findings INCLUDED (no
+#     --ignore-unfixed), non-zero exit on any matching finding;
+#   - scanner binary byte identity: Trivy v0.74.0 is downloaded from the
+#     GitHub release archive and verified against a hard-coded SHA-256
+#     constant committed in this file (Model B). No third-party GitHub Action
+#     executes in this workflow. The upstream v0.74.0 release is immutable
+#     (GitHub immutable release); the committed digest fixes the executed
+#     bytes thereafter;
+#   - image identity mirrors the trusted builder boundary: ghcr.io +
+#     namespace == lowercase(caller repository owner), package [a-z0-9._-]+,
+#     no tag/digest suffix, no nested path;
+#   - v1 supports a SINGLE image manifest only. OCI image index / Docker
+#     manifest list input fails closed via a direct GHCR OCI Distribution API
+#     guard (manifest requested by digest; content-type and Docker-Content-
+#     Digest equality checked; never a tag);
+#   - no caller source checkout; caller-controlled trivy.yaml/.trivyignore
+#     cannot influence the decision (explicit empty config + ignorefile, job
+#     local paths under RUNNER_TEMP);
+#   - remote image source is forced (--image-src remote); local docker /
+#     containerd / podman state is never used;
+#   - no persistent vulnerability DB cache: each job starts with a fresh
+#     job-local cache and acquires/updates the DB; DB failure is a job failure;
+#   - caller inputs: image + digest only. No severity/args/config/ignore/
+#     registry/warn-only caller knobs. No secrets. No outputs.
+#   - permissions ceiling: packages:read only. No checkout, no write scopes,
+#     no PAT. Registry auth uses the caller's automatic GITHUB_TOKEN when the
+#     artifact is not anonymously readable (anonymous-first).
+#
+# Caller contract: invoke with image (ghcr.io/<caller-owner>/<package>) and
+# digest (sha256:<64 hex>) from a trusted source (e.g. the trusted builder's
+# digest output). The called workflow result is the gate: SUCCESS only when
+# the scanned artifact has no HIGH/CRITICAL known vulnerability.
+name: Container vulnerability scan
+
+on:
+  workflow_call:
+    inputs:
+      image:
+        required: true
+        type: string
+        description: GHCR image name without tag or digest, e.g. ghcr.io/<owner>/<package>
+      digest:
+        required: true
+        type: string
+        description: Exact immutable image digest, sha256:<64 lowercase hex>
+
+permissions:
+  packages: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Validate image and digest inputs (fail closed)
+        id: validate
+        env:
+          IMAGE_INPUT: ${{ inputs.image }}
+          DIGEST_INPUT: ${{ inputs.digest }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          [ -n "$IMAGE_INPUT" ] && [ -n "$DIGEST_INPUT" ] || {
+            echo "::error::image and digest are required"; exit 1; }
+          case "$IMAGE_INPUT" in
+            *$'\n'*|*$'\r'*) echo "::error::image contains control characters"; exit 1 ;;
+          esac
+          OWNER_LC=$(printf '%s' "${GITHUB_REPOSITORY%%/*}" | tr '[:upper:]' '[:lower:]')
+          [ -n "$OWNER_LC" ] || { echo "::error::cannot derive caller owner"; exit 1; }
+          case "$IMAGE_INPUT" in
+            ghcr.io/*) ;;
+            *) echo "::error::image must be ghcr.io/<owner>/<package>"; exit 1 ;;
+          esac
+          rest="${IMAGE_INPUT#ghcr.io/}"
+          ns="${rest%%/*}"
+          pkg="${rest#*/}"
+          [ "$ns" = "$OWNER_LC" ] || {
+            echo "::error::image namespace '$ns' must equal caller owner '$OWNER_LC'"; exit 1; }
+          case "$pkg" in
+            "" ) echo "::error::image package is empty"; exit 1 ;;
+            */*) echo "::error::nested package paths are not supported"; exit 1 ;;
+            *:*|*@*) echo "::error::image must not contain a tag or digest"; exit 1 ;;
+            *[!a-z0-9._-]*) echo "::error::invalid package name '$pkg'"; exit 1 ;;
+          esac
+          printf '%s' "$DIGEST_INPUT" | grep -Eq '^sha256:[0-9a-f]{64}$' || {
+            echo "::error::digest must match sha256:<64 lowercase hex>"; exit 1; }
+          printf 'image-ref=%s@%s\n' "$IMAGE_INPUT" "$DIGEST_INPUT" >> "$GITHUB_OUTPUT"
+          printf 'repo=%s/%s\n' "$ns" "$pkg" >> "$GITHUB_OUTPUT"
+          echo "validated: ${ns}/${pkg}@${DIGEST_INPUT}"
+
+      - name: Verify single image manifest in GHCR (fail closed on index/list)
+        id: manifest
+        env:
+          INPUT_REPO: ${{ steps.validate.outputs.repo }}
+          INPUT_DIGEST: ${{ inputs.digest }}
+          GITHUB_ACTOR: ${{ github.actor }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          REPO="$INPUT_REPO"
+          DIGEST="$INPUT_DIGEST"
+          AUTH=anon
+          TOK=""
+          tok=$(curl -fsSL --max-time 30 "https://ghcr.io/token?service=ghcr.io&scope=repository:${REPO}:pull" \
+            | jq -r '.token // empty' 2>/dev/null || true)
+          if [ -n "$tok" ]; then
+            TOK="$tok"
+          else
+            tok=$(curl -fsSL --max-time 30 -u "$GITHUB_ACTOR:$GITHUB_TOKEN" \
+              "https://ghcr.io/token?service=ghcr.io&scope=repository:${REPO}:pull" \
+              | jq -r '.token // empty')
+            [ -n "$tok" ] || { echo "::error::could not acquire GHCR pull token for ${REPO}"; exit 1; }
+            AUTH=token
+          fi
+          HDR="$RUNNER_TEMP/manifest-headers"
+          curl -fsSL --max-time 60 -D "$HDR" -o /dev/null \
+            -H "Authorization: Bearer $tok" \
+            -H 'Accept: application/vnd.oci.image.manifest.v1+json, application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.v2+json, application/vnd.docker.distribution.manifest.list.v2+json' \
+            "https://ghcr.io/v2/${REPO}/manifests/${DIGEST}" \
+            || { echo "::error::manifest request for ${REPO}@${DIGEST} failed"; exit 1; }
+          ct=$(grep -iE '^content-type:' "$HDR" | sed 's/^[Cc]ontent-[Tt]ype:[[:space:]]*//' | tr -d '\r')
+          dc=$(grep -iE '^docker-content-digest:' "$HDR" | sed 's/^[Dd]ocker-[Cc]ontent-[Dd]igest:[[:space:]]*//' | tr -d '\r')
+          case "$ct" in
+            application/vnd.oci.image.manifest.v1+json|application/vnd.docker.distribution.manifest.v2+json) ;;
+            *)
+              echo "::error::unsupported manifest media type '$ct' (single image manifest required)"
+              exit 1
+              ;;
+          esac
+          [ "$dc" = "$DIGEST" ] || {
+            echo "::error::manifest digest mismatch (got '$dc', expected '$DIGEST')"; exit 1; }
+          echo "auth-mode=$AUTH" >> "$GITHUB_OUTPUT"
+          echo "manifest OK: ${REPO}@${DIGEST} (${ct})"
+
+      - name: Install Trivy v0.74.0 (checksum-pinned, x64 only)
+        env:
+          TRIVY_VERSION: "0.74.0"
+          TRIVY_SHA256: "2ae6fe3ee734b7fdf11335663e18c75ea12dccc76062f09f164a3b0f8be4371a"
+          RUNNER_ARCH: ${{ runner.arch }}
+        run: |
+          set -euo pipefail
+          [ "$RUNNER_ARCH" = "X64" ] || {
+            echo "::error::pinned Trivy archive is linux x86-64; runner arch '$RUNNER_ARCH' unsupported"
+            exit 1; }
+          url="https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          archive="$RUNNER_TEMP/trivy.tar.gz"
+          bindir="$RUNNER_TEMP/trivy-bin"
+          curl -fSL --max-time 120 -o "$archive" "$url"
+          echo "${TRIVY_SHA256}  ${archive}" | sha256sum -c -
+          mkdir -p "$bindir"
+          tar -xzf "$archive" -C "$bindir" trivy
+          chmod +x "$bindir/trivy"
+          "$bindir/trivy" --version
+          ver=$("$bindir/trivy" --version)
+          case "$ver" in
+            *"$TRIVY_VERSION"*) ;;
+            *) echo "::error::unexpected trivy version: $ver"; exit 1 ;;
+          esac
+          echo "$bindir" >> "$GITHUB_PATH"
+
+      - name: Prepare isolated Trivy configuration
+        id: env
+        run: |
+          set -euo pipefail
+          CONFIG="$RUNNER_TEMP/trivy-empty.yaml"
+          IGNORE="$RUNNER_TEMP/trivy-empty.ignore"
+          CACHE="$RUNNER_TEMP/trivy-cache"
+          mkdir -p "$CACHE"
+          printf '# intentionally empty configuration\n' > "$CONFIG"
+          printf '# intentionally empty ignore list\n' > "$IGNORE"
+          echo "config=$CONFIG" >> "$GITHUB_OUTPUT"
+          echo "ignorefile=$IGNORE" >> "$GITHUB_OUTPUT"
+          echo "cache=$CACHE" >> "$GITHUB_OUTPUT"
+
+      - name: Scan immutable artifact (fixed HIGH,CRITICAL policy)
+        env:
+          IMAGE_REF: ${{ steps.validate.outputs.image-ref }}
+          CONFIG: ${{ steps.env.outputs.config }}
+          IGNOREFILE: ${{ steps.env.outputs.ignorefile }}
+          CACHE: ${{ steps.env.outputs.cache }}
+          AUTH_MODE: ${{ steps.manifest.outputs.auth-mode }}
+          GITHUB_ACTOR: ${{ github.actor }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ "$AUTH_MODE" = "token" ]; then
+            export TRIVY_USERNAME="$GITHUB_ACTOR"
+            export TRIVY_PASSWORD="$GITHUB_TOKEN"
+          fi
+          echo "scanning $IMAGE_REF (remote, vuln-only, HIGH+CRITICAL, unfixed included)"
+          trivy --config "$CONFIG" --cache-dir "$CACHE" --timeout 10m \
+            image \
+            --image-src remote \
+            --scanners vuln \
+            --severity HIGH,CRITICAL \
+            --pkg-types os,library \
+            --exit-code 1 \
+            --ignorefile "$IGNOREFILE" \
+            "$IMAGE_REF"
+          echo "scan OK: no HIGH/CRITICAL vulnerabilities in $IMAGE_REF"

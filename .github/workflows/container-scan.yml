@@ -71,8 +71,10 @@ jobs:
           GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
           set -euo pipefail
-          [ -n "$IMAGE_INPUT" ] && [ -n "$DIGEST_INPUT" ] || {
-            echo "::error::image and digest are required"; exit 1; }
+          if [ -z "$IMAGE_INPUT" ] || [ -z "$DIGEST_INPUT" ]; then
+            echo "::error::image and digest are required"
+            exit 1
+          fi
           case "$IMAGE_INPUT" in
             *$'\n'*|*$'\r'*) echo "::error::image contains control characters"; exit 1 ;;
           esac
@@ -95,8 +97,10 @@ jobs:
           esac
           printf '%s' "$DIGEST_INPUT" | grep -Eq '^sha256:[0-9a-f]{64}$' || {
             echo "::error::digest must match sha256:<64 lowercase hex>"; exit 1; }
-          printf 'image-ref=%s@%s\n' "$IMAGE_INPUT" "$DIGEST_INPUT" >> "$GITHUB_OUTPUT"
-          printf 'repo=%s/%s\n' "$ns" "$pkg" >> "$GITHUB_OUTPUT"
+          {
+            printf 'image-ref=%s@%s\n' "$IMAGE_INPUT" "$DIGEST_INPUT"
+            printf 'repo=%s/%s\n' "$ns" "$pkg"
+          } >> "$GITHUB_OUTPUT"
           echo "validated: ${ns}/${pkg}@${DIGEST_INPUT}"
 
       - name: Verify single image manifest in GHCR (fail closed on index/list)
@@ -111,12 +115,9 @@ jobs:
           REPO="$INPUT_REPO"
           DIGEST="$INPUT_DIGEST"
           AUTH=anon
-          TOK=""
           tok=$(curl -fsSL --max-time 30 "https://ghcr.io/token?service=ghcr.io&scope=repository:${REPO}:pull" \
             | jq -r '.token // empty' 2>/dev/null || true)
-          if [ -n "$tok" ]; then
-            TOK="$tok"
-          else
+          if [ -z "$tok" ]; then
             tok=$(curl -fsSL --max-time 30 -u "$GITHUB_ACTOR:$GITHUB_TOKEN" \
               "https://ghcr.io/token?service=ghcr.io&scope=repository:${REPO}:pull" \
               | jq -r '.token // empty')
@@ -179,9 +180,11 @@ jobs:
           mkdir -p "$CACHE"
           printf '# intentionally empty configuration\n' > "$CONFIG"
           printf '# intentionally empty ignore list\n' > "$IGNORE"
-          echo "config=$CONFIG" >> "$GITHUB_OUTPUT"
-          echo "ignorefile=$IGNORE" >> "$GITHUB_OUTPUT"
-          echo "cache=$CACHE" >> "$GITHUB_OUTPUT"
+          {
+            echo "config=$CONFIG"
+            echo "ignorefile=$IGNORE"
+            echo "cache=$CACHE"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Scan immutable artifact (fixed HIGH,CRITICAL policy)
         env:
